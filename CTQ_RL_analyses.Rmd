@@ -1,0 +1,1981 @@
+---
+title: "Tables and figures from: Emotional and physical abuse have dissociable impacts on punishment learning and task engagement during adolescence"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+<style>
+  table.simple-table { border-collapse: collapse; font-size: 12px; margin-bottom: 24px; width: auto; }
+  table.simple-table th { border-top: 2px solid black; border-bottom: 1px solid black; padding: 3px 8px; text-align: center; }
+  table.simple-table td { padding: 3px 8px; text-align: center; vertical-align: top; }
+  table.simple-table td:first-child, table.simple-table th:first-child { text-align: left; }
+  table.simple-table tr:last-child td { border-bottom: 2px solid black; }
+  h2 { margin-top: 40px; }
+</style>
+
+```{r setup, include = FALSE}
+# =============================================================================
+# HOW THIS FILE IS ORGANIZED
+# -----------------------------------------------------------------------------
+# This R Markdown file recreates the tables and figures of the paper, starting
+# with main-text Table 3 and Figure 1 and then going through the Supplemental
+# Material in the order in which it is presented. Each section is a heading
+# (what is being produced) followed by one code chunk that produces it.
+#
+# The first few chunks (setup, helper functions, and "fit all models") produce
+# no output; they prepare what the later chunks need.
+#
+# HOW TO RUN: put this file in the same folder as CTQ_RL_data.csv and knit it
+# (e.g., in RStudio, click "Knit"). All paths are relative to this file's folder.
+# Knitting takes several minutes because many mixed models are fit.
+#
+# NOT REPRODUCED HERE:
+#   - Supplemental Table 4 (model recovery) and Supplemental Figure 2 (model
+#     simulations) require running the Stan models; code available upon request.
+# =============================================================================
+
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+
+library(lme4)          # mixed-effects (multilevel) models
+library(lmerTest)      # Satterthwaite p-values for lme4 models
+library(interactions)  # Johnson-Neyman intervals
+library(MuMIn)         # R-squared for mixed models (r.squaredGLMM)
+library(MASS)          # mvrnorm(): Monte Carlo draws for Supplemental Table 16
+library(ggplot2)       # figures
+library(patchwork)     # combining several ggplots into one figure
+library(parallel)      # running the leave-one-participant-out refits in parallel
+
+# Number of cores for the leave-one-participant-out refits (Supplemental
+# Table 15). mclapply() cannot run in parallel on Windows, so use 1 core there.
+n_cores <- if (.Platform$OS.type == "windows") 1 else max(1, min(4, detectCores() - 1))
+```
+
+```{r load-data}
+# -----------------------------------------------------------------------------
+# DATA. One row per participant per study wave (see README.txt for a dictionary
+# of every variable). Learning parameters are the posterior means from the
+# PoP-ORL model (already fit); CTQ and covariates are already merged in.
+# -----------------------------------------------------------------------------
+dat <- read.csv("CTQ_RL_data.csv")
+
+# Last-block traditional scores are the primary version used in the paper;
+# the full-task versions (good_proportion, bad_proportion, net_good_bad) are
+# used only in Supplemental Tables 8 and 11.
+
+# The eight learning metrics ("outcomes") analyzed in the paper, in paper order.
+# name = variable in the data file, value = label used in the tables.
+outcomes <- c(
+  good_proportion_LastBlock = "Good Deck Proportion (Last Block)",
+  bad_proportion_LastBlock  = "Bad Deck Proportion (Last Block)",
+  net_good_bad_LastBlock    = "Net Performance (Good Proportion – Bad Proportion) (Last Block)",
+  betaB                     = "Go Bias (βb)",
+  Arew_qnormed              = "Reward Learning Rate (Arew)",
+  Apun_qnormed              = "Punishment Learning Rate (Apun)",
+  Overall_A                 = "Averaged Single Learning Rate ((Arew + Apun)/2)",
+  betaF                     = "Win/Loss Frequency Sensitivity (βf)")
+
+# The same three traditional metrics computed from ALL trials (Supp. Tables 8, 11)
+fulltask_outcomes <- c(
+  good_proportion = "Good Deck Proportion (full task)",
+  bad_proportion  = "Bad Deck Proportion (full task)",
+  net_good_bad    = "Net Performance (full task)")
+
+# Shorter labels used in the summary tables (Table 3, Supp. Tables 10 and 11)
+short_label <- c(
+  good_proportion_LastBlock = "Good Deck Proportion (last block)",
+  bad_proportion_LastBlock  = "Bad Deck Proportion (last block)",
+  net_good_bad_LastBlock    = "Net Performance (last block)",
+  betaB = "Go Bias (βb)", Arew_qnormed = "Reward Learning Rate (Arew)",
+  Apun_qnormed = "Punishment Learning Rate (Apun)",
+  Overall_A = "Averaged Single Learning Rate ((Arew + Apun)/2)",
+  betaF = "Win/Loss Frequency Sensitivity (βf)",
+  good_proportion = "Good Deck Proportion (full task)",
+  bad_proportion  = "Bad Deck Proportion (full task)",
+  net_good_bad    = "Net Performance (full task)")
+
+# The seven CTQ adversity predictors: two composites and five subscales.
+#   centered = mean-centered score used in the models
+#   raw      = raw CTQ score (5-25 per subscale), used to report J-N intervals
+predictors <- data.frame(
+  key      = c("A", "N", "EA", "PA", "SA", "EN", "PN"),
+  title    = c("Abuse Composite", "Neglect Composite", "Emotional Abuse (EA)", "Physical Abuse (PA)",
+               "Sexual Abuse (SA)", "Emotional Neglect (EN)", "Physical Neglect (PN)"),
+  name     = c("Abuse Composite", "Neglect Composite", "Emotional Abuse", "Physical Abuse",
+               "Sexual Abuse", "Emotional Neglect", "Physical Neglect"),
+  abbr     = c("Abuse Composite", "Neglect Composite", "EA", "PA", "SA", "EN", "PN"),
+  centered = paste0("ctq_", c("A", "N", "EA", "PA", "SA", "EN", "PN"), "_T1_c"),
+  raw      = paste0("ctq_", c("A", "N", "EA", "PA", "SA", "EN", "PN"), "_T1_avg"),
+  stringsAsFactors = FALSE)
+rownames(predictors) <- predictors$key
+subscales <- c("EA", "PA", "SA", "EN", "PN")
+
+# Covariates in Models 3 and 4 and the random-effects structure of every model:
+# a random intercept and a random age slope for each participant.
+covariates <- "NonVerbal_Std_centered + child_sex + eprime"
+random_fx  <- "(1 | id) + (0 + age_centered | id)"
+```
+
+```{r helper-functions}
+# =============================================================================
+# HELPER FUNCTIONS (no output)
+# =============================================================================
+
+# --- Formatting --------------------------------------------------------------
+# Number with 3 decimals and no leading zero (e.g., -0.045 -> "-.045")
+f3 <- function(x, digits = 3) sub("^(-?)0\\.", "\\1.", sprintf(paste0("%.", digits, "f"), x))
+# Number with 2 decimals and no leading zero
+f2 <- function(x) f3(x, 2)
+# p-value: "<.001" or three decimals with no leading zero
+fp <- function(p) ifelse(is.na(p), "", ifelse(p < .001, "<.001", sub("^0", "", sprintf("%.3f", p))))
+# Significance stars from a p-value
+stars <- function(p) ifelse(is.na(p), "", ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p < .05, "*", ""))))
+# Estimate, stars, and 95% CI on two lines, e.g., "-.009 **<br>[-.015 – -.003]"
+cell_est_ci <- function(est, lo, hi, p, bold = FALSE) {
+  s <- stars(p)
+  txt <- sprintf("%s%s\n[%s – %s]", f3(est), ifelse(s == "", "", paste0(" ", s)), f3(lo), f3(hi))
+  if (bold) txt <- paste0("<b>", gsub("\n", "</b>\n<b>", txt), "</b>")
+  txt
+}
+
+# --- Showing a data frame as a simple HTML table -----------------------------
+show_table <- function(df) {
+  # When a chunk is run by itself in RStudio (not knitted), return a plain data
+  # frame, which RStudio always shows as a table. (The HTML formatting used for
+  # the knitted file is stripped: <b> bold tags removed, line breaks -> spaces.)
+  running_alone <- isTRUE(getOption("rstudio.notebook.executing")) || !isTRUE(getOption("knitr.in.progress"))
+  if (running_alone) {
+    df[] <- lapply(df, function(x) trimws(gsub("<br>|\\n", " ", gsub("</?b>", "", as.character(x)))))
+    return(df)
+  }
+  # When knitting: an HTML table, with line breaks inside cells
+  df[] <- lapply(df, function(x) gsub("\n", "<br>", as.character(x)))
+  knitr::kable(df, format = "html", escape = FALSE, row.names = FALSE,
+               table.attr = 'class="simple-table"')
+}
+
+# --- Fitting one mixed model -------------------------------------------------
+# Maximum likelihood (so models can be compared with likelihood-ratio tests).
+# If the fit is singular (random-slope variance estimated at ~0), the random age
+# slope is dropped and the model is refit with a random intercept only. This is
+# expected for some Good Deck Proportion models and is shown in the output as "—"
+# in the tau-11 row of the Supplemental Table 9 sub-tables (see its caption).
+fit_lmm <- function(formula, data) {
+  ctrl <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  # (suppressMessages hides lme4's "boundary (singular) fit" message; the singular
+  # case is handled on purpose just below)
+  m <- tryCatch(suppressMessages(lmer(as.formula(formula), data = data, REML = FALSE, control = ctrl)),
+                error = function(e) NULL)
+  slope_dropped <- FALSE
+  if (!is.null(m) && isSingular(m)) {
+    f_no_slope <- sub("\\(1 \\| id\\) \\+ \\(0 \\+ age_centered \\| id\\)", "(1 | id)", formula)
+    m2 <- tryCatch(suppressMessages(lmer(as.formula(f_no_slope), data = data, REML = FALSE, control = ctrl)),
+                   error = function(e) NULL)
+    if (!is.null(m2)) { m <- m2; slope_dropped <- TRUE }
+  }
+  list(model = m, slope_dropped = slope_dropped)
+}
+
+# --- Unconditional growth: linear (Model 1) vs. quadratic (Model 2) ----------
+# Fits both models and compares them with a likelihood-ratio test. The quadratic
+# model is kept only if p < .05.
+growth_shape <- function(outcome, data) {
+  r1 <- fit_lmm(paste(outcome, "~ age_centered +", random_fx), data)
+  r2 <- fit_lmm(paste(outcome, "~ age_centered + age_squared +", random_fx), data)
+  m2_for_test <- r2$model
+  # If Model 1 had to drop its random slope but Model 2 did not, refit Model 2
+  # without the slope as well so the two models differ only in the quadratic term.
+  if (r1$slope_dropped && !r2$slope_dropped) {
+    m2_for_test <- lmer(as.formula(paste(outcome, "~ age_centered + age_squared + (1 | id)")),
+                        data = data, REML = FALSE,
+                        control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+  }
+  lrt <- anova(r1$model, m2_for_test, test = "LRT")
+  list(r1 = r1, r2 = r2, lrt = lrt, p_lrt = lrt$`Pr(>Chisq)`[2],
+       use_quadratic = !is.na(lrt$`Pr(>Chisq)`[2]) && lrt$`Pr(>Chisq)`[2] < .05)
+}
+
+# --- The full nested-model sequence (Models 1-4) for one outcome and predictor
+#   Model 1: linear growth (age)
+#   Model 2: quadratic growth (age + age^2)
+#   Model 3: winning growth shape + covariates (IQ, sex, administration mode)
+#   Model 4: Model 3 + CTQ predictor + its interaction with age (and with
+#            age^2 if the quadratic shape won)  <- the primary model of the paper
+# extra_terms: optional extra covariates written as a formula string, used for
+#   the specificity and robustness analyses (Supp. Tables 12 and 13).
+fit_models <- function(outcome, ctq_var, data, extra_terms = "") {
+  gs   <- growth_shape(outcome, data)
+  quad <- gs$use_quadratic
+  growth <- if (quad) "age_centered + age_squared" else "age_centered"
+  M3 <- fit_lmm(paste(outcome, "~", growth, extra_terms, "+", covariates, "+", random_fx), data)
+  f4 <- if (quad) {
+    paste(outcome, "~ age_centered *", ctq_var, "+ age_squared *", ctq_var, extra_terms,
+          "+", covariates, "+", random_fx)
+  } else {
+    paste(outcome, "~ age_centered *", ctq_var, extra_terms, "+", covariates, "+", random_fx)
+  }
+  M4 <- fit_lmm(f4, data)
+  # The age^2 x CTQ interaction is FDR-corrected across all eight outcomes, so we
+  # also need it for outcomes where the linear shape won: fit a quadratic Model 4
+  # for every outcome (this is just Model 4 when the quadratic shape already won).
+  if (quad) {
+    M4_quad <- M4$model
+  } else {
+    M4_quad <- fit_lmm(paste(outcome, "~ age_centered *", ctq_var, "+ age_squared *", ctq_var,
+                             extra_terms, "+", covariates, "+", random_fx), data)$model
+  }
+  ref <- if (quad) gs$r2$model else gs$r1$model        # the winning unconditional model
+  list(outcome = outcome, ctq_var = ctq_var, use_quadratic = quad, growth = gs,
+       M1 = gs$r1$model, M2 = gs$r2$model, M3 = M3$model, M4 = M4$model, M4_quad = M4_quad,
+       slope_dropped = c(gs$r1$slope_dropped, gs$r2$slope_dropped, M3$slope_dropped, M4$slope_dropped),
+       lrt_12   = gs$lrt,
+       lrt_ref3 = anova(ref, M3$model, test = "LRT"),   # Model 3 vs. winning unconditional model
+       lrt_ref4 = anova(ref, M4$model, test = "LRT"),   # Model 4 vs. winning unconditional model
+       lrt_34   = anova(M3$model, M4$model, test = "LRT"))  # Model 4 vs. Model 3
+}
+
+# --- Pulling numbers out of fitted models ------------------------------------
+# Fixed effects: estimate, 95% Wald CI, and p-value (one row per term)
+fixed_effects <- function(model) {
+  s <- summary(model)$coefficients
+  data.frame(term = rownames(s), est = s[, "Estimate"],
+             lo = s[, "Estimate"] - 1.96 * s[, "Std. Error"],
+             hi = s[, "Estimate"] + 1.96 * s[, "Std. Error"],
+             p = s[, "Pr(>|t|)"], row.names = NULL, stringsAsFactors = FALSE)
+}
+# Names of the three CTQ terms in Model 4
+ctq_terms <- function(ctq_var) {
+  c(baseline = ctq_var,                         # CTQ effect at the centering age
+    age      = paste0("age_centered:", ctq_var),   # CTQ x age interaction
+    age2     = paste0(ctq_var, ":age_squared"))    # CTQ x age^2 interaction
+}
+# p-value of a CTQ term from a fit_models() result. The age^2 interaction comes
+# from the quadratic Model 4 so that it exists for every outcome.
+term_p <- function(fit, which) {
+  model <- if (which == "age2") fit$M4_quad else fit$M4
+  fe <- fixed_effects(model)
+  fe$p[fe$term == ctq_terms(fit$ctq_var)[[which]]]
+}
+# Random-effect variances, intraclass correlation, and R-squared of a model
+random_effects <- function(model, slope_dropped) {
+  vc <- VarCorr(model)
+  list(sigma2 = sigma(model)^2, tau00 = vc[["id"]][1, 1],
+       tau11 = if (slope_dropped) NA else vc[["id.1"]][1, 1])
+}
+icc <- function(model) { re <- random_effects(model, TRUE); re$tau00 / (re$tau00 + re$sigma2) }
+r2  <- function(model) r.squaredGLMM(model)[1, c("R2c", "R2m")]   # conditional and marginal
+
+# --- Johnson-Neyman interval for the age x CTQ interaction -------------------
+# Finds the CTQ scores at which the age slope is significantly different from
+# zero. Bounds are shifted back to the raw CTQ-score scale. Returns text such as
+# "< 5.64; > 9.18" (slope significant below/above these scores).
+jn_object <- function(model, ctq_var) {
+  # (johnson_neyman() needs the variable names unquoted, hence bquote())
+  tryCatch(suppressWarnings(eval(bquote(
+    interactions::johnson_neyman(.(model), pred = age_centered, modx = .(as.name(ctq_var)),
+                                 alpha = .05, plot = FALSE)))), error = function(e) NULL)
+}
+ctq_offset <- function(ctq_var) mean(dat[[sub("_c$", "_avg", ctq_var)]], na.rm = TRUE)  # centering constant
+jn_text <- function(model, ctq_var) {
+  jn <- jn_object(model, ctq_var)
+  if (is.null(jn)) return("")
+  bounds <- sort(as.numeric(jn$bounds) + ctq_offset(ctq_var))
+  if (length(bounds) == 0) return("all observed values")
+  if (length(bounds) == 2) {
+    b <- sprintf("%.2f", bounds)
+    return(if (isTRUE(jn$inside_interval)) paste0(b[1], " – ", b[2]) else paste0("< ", b[1], "; > ", b[2]))
+  }
+  sprintf("crossover at %.2f", bounds)
+}
+```
+
+```{r fit-all-models}
+# =============================================================================
+# FIT ALL MODELS (no output)
+# For every CTQ predictor x learning metric, fit Models 1-4. Results are stored
+# in fits[[predictor key]][[outcome name]] and reused by the tables below.
+# =============================================================================
+fits <- list()
+for (k in predictors$key) {
+  fits[[k]] <- list()
+  for (y in names(outcomes)) {
+    fits[[k]][[y]] <- fit_models(y, predictors[k, "centered"], dat)
+  }
+}
+
+# Same models for the three traditional metrics computed from the full task
+# (needed for Supplemental Table 11); only the five subscales are analyzed.
+fits_full <- list()
+for (k in subscales) {
+  fits_full[[k]] <- list()
+  for (y in names(fulltask_outcomes)) {
+    fits_full[[k]][[y]] <- fit_models(y, predictors[k, "centered"], dat)
+  }
+}
+
+# False discovery rate (Benjamini-Hochberg) correction: for each CTQ predictor
+# and each model term (baseline effect, age interaction, age^2 interaction), the
+# p-values are corrected across the eight learning metrics. Returns a matrix of
+# corrected p-values (rows = the three terms, columns = metrics).
+fdr_correct <- function(fit_list, family) {
+  q <- sapply(family, function(y) rep(NA_real_, 3))
+  rownames(q) <- c("baseline", "age", "age2")
+  for (w in rownames(q)) {
+    p <- sapply(family, function(y) term_p(fit_list[[y]], w))
+    q[w, ] <- p.adjust(p, method = "BH")
+  }
+  q
+}
+fdr <- lapply(setNames(predictors$key, predictors$key), function(k) fdr_correct(fits[[k]], names(outcomes)))
+# Full-task version: the family of eight is the three full-task traditional
+# metrics plus the five model-based metrics.
+fdr_full <- lapply(setNames(subscales, subscales), function(k) {
+  fl <- c(fits_full[[k]], fits[[k]][names(outcomes)[4:8]])
+  fdr_correct(fl, c(names(fulltask_outcomes), names(outcomes)[4:8]))
+})
+```
+
+```{r summary-table-function}
+# =============================================================================
+# FUNCTION that builds the "summary" tables (Table 3, Supp. Tables 10 and 11):
+# one column per CTQ predictor; for each learning metric, the baseline effect and
+# the age (and age^2) interaction as estimate [95% CI]. Stars = uncorrected p
+# (* < .05, ** < .01, *** < .001). Bold = survives FDR correction (q < .05).
+# A Johnson-Neyman row is added under age interactions that survive FDR correction.
+# =============================================================================
+summary_table <- function(pred_keys, fit_sets, fdr_sets, metrics) {
+  header <- c("", predictors[pred_keys, "title"])
+  rows <- list()
+  add <- function(...) rows[[length(rows) + 1]] <<- c(...)
+  for (y in metrics) {
+    add(paste0("<b>", short_label[[y]], "</b>"), rep("", length(pred_keys)))
+    fs <- lapply(pred_keys, function(k) fit_sets[[k]][[y]])
+    one_row <- function(label, which) {
+      cells <- mapply(function(f, k) {
+        fe <- fixed_effects(if (which == "age2") f$M4_quad else f$M4)
+        r <- fe[fe$term == ctq_terms(f$ctq_var)[[which]], ]
+        if (nrow(r) == 0) return("")
+        cell_est_ci(r$est, r$lo, r$hi, r$p, bold = fdr_sets[[k]][which, y] < .05)
+      }, fs, pred_keys)
+      add(label, cells)
+    }
+    one_row("Adversity Baseline Effect", "baseline")
+    one_row("Interaction of Adversity × Age", "age")
+    # Johnson-Neyman row (only for age interactions that survive FDR correction)
+    sig <- sapply(pred_keys, function(k) fdr_sets[[k]]["age", y] < .05)
+    if (any(sig)) {
+      jn <- mapply(function(f, k, s) {
+        if (!s) return("")
+        p <- term_p(f, "age")
+        paste0(jn_text(f$M4, f$ctq_var), ifelse(stars(p) == "", "", paste0(" ", stars(p))))
+      }, fs, pred_keys, sig)
+      add("J-N Adversity Levels of Sig", jn)
+    }
+    # Age^2 interaction row, only shown for metrics whose winning shape is quadratic
+    if (any(sapply(fs, function(f) f$use_quadratic))) {
+      cells <- mapply(function(f, k) {
+        if (!f$use_quadratic) return("")
+        fe <- fixed_effects(f$M4)
+        r <- fe[fe$term == ctq_terms(f$ctq_var)[["age2"]], ]
+        cell_est_ci(r$est, r$lo, r$hi, r$p, bold = fdr_sets[[k]]["age2", y] < .05)
+      }, fs, pred_keys)
+      add("Interaction of Adversity × Age²", cells)
+    }
+  }
+  df <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+  names(df) <- header
+  df
+}
+```
+
+## Table 3 (main text). Effects of Adversity Subtypes on Learning Metric Development
+
+Estimates (unstandardized b) and 95% CIs from Model 4 for each CTQ subscale. Stars show uncorrected p-values; bold shows effects that survive FDR correction. "J-N" rows give the CTQ scores at which the age slope is significant.
+
+```{r table3}
+tab3 <- summary_table(subscales, fits, fdr, names(outcomes))
+show_table(tab3)
+```
+
+## Figure 1 (main text). Effects of Adversity Subtypes on Learning Metric Development Surviving FDR Correction
+
+Same plotting code as the paper's figure. Top: model-predicted trajectories for youth with low (mean − 1 SD) and high (mean + 1 SD) levels of the CTQ subscale, with each participant's data in grey. Bottom: Johnson-Neyman plot of the age-related slope across levels of adversity severity (blue = significant positive slope, grey = not significant, red = significant negative slope; the solid vertical line marks the moderate-severity cutoff; dashed vertical lines mark the boundaries of the region of significance), with an arrow showing low to high adversity. (A) Emotional abuse and Punishment Learning Rate. (B) Physical abuse and Go Bias. (C) Physical abuse and Good Deck Proportion (last block).
+
+```{r figure1-functions}
+# -----------------------------------------------------------------------------
+# FIGURE 1 SETTINGS AND PLOTTING FUNCTIONS (no output)
+# These are the functions used to make the paper's figure: labels, colors, fonts,
+# and the functions that draw the trajectory panel (top), the Johnson-Neyman panel
+# (middle), and the low-to-high adversity arrow (bottom).
+# -----------------------------------------------------------------------------
+library(ggtext)   # formatted (italic / subscript) axis labels and titles
+data <- dat       # the plotting functions below refer to the data as `data`
+
+voi_list <- c(
+  "good_proportion_LastBlock", "bad_proportion_LastBlock", "net_good_bad_LastBlock",
+  "betaB",
+  "Arew_qnormed",    "Apun_qnormed",   "Overall_A",
+  "betaF"
+)
+
+panel_y_labels <- c(
+  "good_proportion_LastBlock" = "Proportion Played",
+  "bad_proportion_LastBlock"     = "Proportion Played",
+  "net_good_bad_LastBlock"       = "Good − Bad<br>Proportion Played",
+  "betaB"              = "&beta;<i>b</i>",
+  "Arew_qnormed"       = "A<sub><i>rew</i></sub>",
+  "Apun_qnormed"       = "A<sub><i>pun</i></sub>",
+  "Overall_A" = "(A<sub><i>rew</i></sub> + A<sub><i>pun</i></sub>)/2",
+  "betaF"              = "&beta;<i>f</i>"
+)
+
+voi_subtitle <- c(
+  "good_proportion_LastBlock" = "Good Deck",
+  "bad_proportion_LastBlock"     = "Bad Deck",
+  "net_good_bad_LastBlock"       = "Net Perform",
+  "betaB"              = "&beta;<i>b</i>",
+  "Arew_qnormed"       = "A<sub><i>rew</i></sub>",
+  "Apun_qnormed"       = "A<sub><i>pun</i></sub>",
+  "Overall_A" = "(A<sub><i>rew</i></sub> + A<sub><i>pun</i></sub>)/2",
+  "betaF"              = "&beta;<i>f</i>"
+)
+
+voi_full_name <- c(
+  "good_proportion_LastBlock" = "Good Deck Proportion",
+  "bad_proportion_LastBlock"     = "Bad Deck Proportion",
+  "net_good_bad_LastBlock"       = "Net Performance",
+  "betaB"              = "Go Bias",
+  "Arew_qnormed"       = "Reward Learning Rate",
+  "Apun_qnormed"       = "Punishment Learning Rate",
+  "Overall_A" = "Averaged Single Learning Rate",
+  "betaF"              = "Win/Loss Frequency Effect"
+)
+
+
+ctq_x_limits <- c(5, 25)
+ctq_x_breaks <- c(5, 10, 15, 20, 25)
+
+ctq_x_expand <- expansion(mult = 0.02)
+
+age_x_breaks <- seq(9, 17, by = 2)
+
+col_low_sig     <- "#009E73"   # green
+col_high_sig    <- "#D55E00"   # orange
+col_cutoff      <- "#000000"   # black — clinical-cutoff vertical line
+
+jn_col_low_sig  <- "#005B8E"   # blue — significant POSITIVE slope
+jn_col_nonsig   <- "#BFBFBF"   # grey — non-significant region (between J-N bounds)
+jn_col_high_sig <- "#A3290E"   # red  — significant NEGATIVE slope
+
+col_low_nonsig  <- "#5FAE99"   # muted green  (50% #009E73 + 50% #BFBFBF)
+col_high_nonsig <- "#CA8F60"   # muted orange (50% #D55E00 + 50% #BFBFBF)
+
+xbar_green   <- col_low_sig    # low-adversity end
+xbar_orange  <- col_high_sig   # high-adversity end
+xbar_neutral <- "#E6E2DA"      # most-neutral tone at the cutoff line
+
+xbar_neutral_halfwidth <- 1.0
+
+xbar_arrow_frac <- 0.04
+
+TITLE_SZ         <- 11         # overall combined-plot title
+SUBPLOT_TITLE_SZ <- 9.5        # per-panel subtitles
+AXIS_TITLE_SZ    <- 10         # x-axis titles
+Y_AXIS_TITLE_SZ  <- 10         # y-axis titles
+AXIS_TEXT_SZ     <- 8          # tick labels
+SUBPLOT_SUB_SZ   <- AXIS_TEXT_SZ  # p-value sub-line — TIED to Y-axis text
+
+panel_font  <- if ("Helvetica Neue" %in% systemfonts::system_fonts()$family) "Helvetica Neue" else "sans"
+
+strip_lead0 <- function(x, digits = 2) {
+  v <- ifelse(is.na(x), NA_character_,
+              sprintf(paste0("%.", digits, "f"), x))
+  v <- sub("^0\\.",  ".",  v)
+  v <- sub("^-0\\.", "-.", v)
+  v
+}
+
+format_p <- function(p) {
+  if (is.na(p)) return("NA")
+  if (p < 0.001) return("&lt; .001")
+  s <- sprintf("%.3f", p)
+  sub("^0", "", s)
+}
+
+fdr_stars <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return(" \\*\\*\\*")
+  if (p < 0.01)  return(" \\*\\*")
+  if (p < 0.05)  return(" \\*")
+  ""
+}
+
+
+xbar_colors <- function(x, cutoff,
+                        x_lo = ctq_x_limits[1], x_hi = ctq_x_limits[2],
+                        hw   = xbar_neutral_halfwidth) {
+  ramp_lo <- grDevices::colorRamp(c(xbar_green,   xbar_neutral))  # low → neutral
+  ramp_hi <- grDevices::colorRamp(c(xbar_neutral, xbar_orange))   # neutral → high
+  to_hex  <- function(m) grDevices::rgb(m[1], m[2], m[3], maxColorValue = 255)
+  clamp01 <- function(t) min(max(t, 0), 1)
+
+  has_cut <- !is.null(cutoff) && is.finite(cutoff) &&
+             cutoff > x_lo && cutoff < x_hi
+
+  vapply(x, function(xi) {
+    if (!has_cut) {
+      t <- clamp01((xi - x_lo) / (x_hi - x_lo))
+      return(to_hex(grDevices::colorRamp(c(xbar_green, xbar_orange))(t)))
+    }
+
+    lo_edge <- max(cutoff - hw, x_lo)   # left edge of the neutral plateau
+    hi_edge <- min(cutoff + hw, x_hi)   # right edge of the neutral plateau
+
+    if (xi <= lo_edge) {
+      denom <- lo_edge - x_lo
+      t <- if (denom > 0) clamp01((xi - x_lo) / denom) else 1
+      to_hex(ramp_lo(t))
+    } else if (xi >= hi_edge) {
+      denom <- x_hi - hi_edge
+      t <- if (denom > 0) clamp01((xi - hi_edge) / denom) else 0
+      to_hex(ramp_hi(t))
+    } else {
+      xbar_neutral                       # neutral plateau around the cutoff
+    }
+  }, character(1))
+}
+
+make_xbar_plot <- function(cutoff, ctq_abbr, base_size = 11) {
+  x_lo <- ctq_x_limits[1]
+  x_hi <- ctq_x_limits[2]
+  head_len <- (x_hi - x_lo) * xbar_arrow_frac   # arrowhead length (severity units)
+
+  shaft_lo <- x_lo + head_len                   # left edge of the gradient shaft
+  shaft_hi <- x_hi - head_len                   # right edge of the gradient shaft
+
+  shaft_h <- 0.30   # half-height of the rectangular shaft (was 0.45)
+  head_h  <- 0.67   # half-height of the (taller, now SMALLER) arrowheads (was 1.0)
+  y_lim   <- 1.0    # plotting-window half-height (kept = old head_h so the panel
+
+  n      <- 512
+  xs     <- seq(shaft_lo, shaft_hi, length.out = n)
+  bar_df <- data.frame(x = xs, fillcol = xbar_colors(xs, cutoff))
+  tile_w <- (shaft_hi - shaft_lo) / (n - 1)
+
+  left_head <- data.frame(
+    x = c(x_lo, shaft_lo, shaft_lo),
+    y = c(0,    head_h,   -head_h)
+  )
+  right_head <- data.frame(
+    x = c(x_hi, shaft_hi, shaft_hi),
+    y = c(0,    head_h,   -head_h)
+  )
+  left_col  <- xbar_colors(x_lo, cutoff)   # green tip (low severity)
+  right_col <- xbar_colors(x_hi, cutoff)   # orange tip (high severity)
+
+  jn_x_lbl <- paste0(ctq_abbr, " Severity")
+
+  ggplot() +
+    geom_polygon(data = left_head,  aes(x = x, y = y),
+                 fill = left_col,  colour = NA) +
+    geom_polygon(data = right_head, aes(x = x, y = y),
+                 fill = right_col, colour = NA) +
+    geom_tile(data = bar_df, aes(x = x, y = 0, fill = fillcol),
+              width = tile_w, height = 2 * shaft_h) +
+    scale_fill_identity() +
+    scale_x_continuous(limits = ctq_x_limits, breaks = ctq_x_breaks,
+                       expand = ctq_x_expand) +
+    scale_y_continuous(limits = c(-y_lim, y_lim),
+                       expand = expansion(mult = 0.08)) +
+    labs(x = jn_x_lbl, y = NULL) +
+    theme_classic(base_size = base_size, base_family = panel_font) +
+    theme(
+      text         = element_text(family = panel_font),
+      axis.title.x = element_text(family = panel_font, size = AXIS_TITLE_SZ),
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.line.x  = element_blank(),
+      axis.line.y  = element_blank(),
+      plot.margin  = margin(0, 8, 4, 8)
+    )
+}
+
+make_trajectory_plot <- function(M4, voi, y_label, ctq_var,
+                                 ctq_label, ctq_abbr,
+                                 raw_p = NA_real_, fdr_p = NA_real_,
+                                 age_bounds = numeric(0),
+                                 vline_bounds = NULL,
+                                 sd_mult = 2,
+                                 base_size = 11,
+                                 effect = "interaction") {
+
+  short_metric <- voi_subtitle[[voi]]
+  voi_title_html <- sprintf(
+    "%s Development for High and Low %s",
+    short_metric, ctq_abbr
+  )
+
+  fdr_sig <- !is.na(fdr_p) && fdr_p < 0.05
+  effect_lbl <- if (identical(effect, "baseline"))
+    sprintf("%s main effect", ctq_abbr) else sprintf("Age &times; %s", ctq_abbr)
+  pval_sub_html <- sprintf(
+    "%s: <i>p</i> = %s; <i>FDR</i> = %s%s",
+    effect_lbl, format_p(raw_p), format_p(fdr_p), fdr_stars(fdr_p)
+  )
+  pval_sub_color <- if (fdr_sig) "red" else "black"
+
+  if (is.null(M4)) {
+    return(ggplot() + theme_void() + labs(title = voi_title_html) +
+             annotate("text", x = 0.5, y = 0.5, label = "Model failed",
+                      family = panel_font, colour = "grey40"))
+  }
+
+  ctq_mean <- mean(data[[ctq_var]], na.rm = TRUE)
+  ctq_sd   <- sd(  data[[ctq_var]], na.rm = TRUE)
+
+  cov_means <- list(
+    NonVerbal_Std_centered = 0,
+    child_sex              = mean(data$child_sex, na.rm = TRUE),
+    eprime                 = mean(data$eprime,    na.rm = TRUE)
+  )
+
+  age_c_range <- seq(min(data$age_centered, na.rm = TRUE),
+                     max(data$age_centered, na.rm = TRUE),
+                     length.out = 200)
+  has_age   <- "age" %in% names(data)
+  age_offset <- if (has_age)
+    mean(data$age - data$age_centered, na.rm = TRUE) else 0
+
+  vcov_M4  <- as.matrix(vcov(M4))
+  fe_terms <- delete.response(terms(lme4::nobars(formula(M4))))
+
+  build_pred <- function(level_key, ctq_val) {
+    df <- data.frame(
+      age_centered           = age_c_range,
+      age_squared            = age_c_range^2,
+      NonVerbal_Std_centered = cov_means$NonVerbal_Std_centered,
+      child_sex              = cov_means$child_sex,
+      eprime                 = cov_means$eprime,
+      ctq_level              = level_key,
+      stringsAsFactors       = FALSE
+    )
+    df[[ctq_var]] <- ctq_val
+    df$predicted  <- tryCatch(predict(M4, newdata = df, re.form = NA),
+                              error = function(e) rep(NA_real_, nrow(df)))
+    ci_vals <- tryCatch({
+      mm     <- model.matrix(fe_terms, data = df)
+      shared <- intersect(colnames(mm), colnames(vcov_M4))
+      se     <- sqrt(pmax(diag(mm[, shared] %*%
+                               tcrossprod(vcov_M4[shared, shared],
+                                          mm[, shared])), 0))
+      list(lo = df$predicted - 1.96 * se,
+           hi = df$predicted + 1.96 * se)
+    }, error = function(e) list(lo = rep(NA_real_, nrow(df)),
+                                hi = rep(NA_real_, nrow(df))))
+    df$ci_lo <- ci_vals$lo
+    df$ci_hi <- ci_vals$hi
+    df
+  }
+
+  pred_high <- build_pred("plus_sd",  ctq_mean + sd_mult * ctq_sd)
+  pred_low  <- build_pred("minus_sd", ctq_mean - sd_mult * ctq_sd)
+  pred_high$age_x <- pred_high$age_centered + age_offset
+  pred_low$age_x  <- pred_low$age_centered  + age_offset
+
+  interp_at_x <- function(df, x_target) {
+    x <- df$age_x
+    if (x_target < min(x) || x_target > max(x)) return(NULL)
+    i_lo <- max(which(x <= x_target))
+    i_hi <- min(which(x >= x_target))
+    if (i_lo == i_hi) return(df[i_lo, , drop = FALSE])
+    frac <- (x_target - x[i_lo]) / (x[i_hi] - x[i_lo])
+    row  <- df[i_lo, , drop = FALSE]
+    for (col in c("predicted", "ci_lo", "ci_hi", "age_centered")) {
+      row[[col]] <- df[[col]][i_lo] +
+                    frac * (df[[col]][i_hi] - df[[col]][i_lo])
+    }
+    row$age_x <- x_target
+    row
+  }
+
+  split_level <- function(df_level, age_bounds) {
+    df_level <- df_level[order(df_level$age_x), ]
+    xlo <- min(df_level$age_x); xhi <- max(df_level$age_x)
+
+    if (length(age_bounds) < 2) {
+      df_level$region     <- "sig"
+      df_level$sub_region <- "sig_all"
+      return(df_level)
+    }
+
+    b1 <- min(age_bounds); b2 <- max(age_bounds)
+
+    if (b2 <= xlo || b1 >= xhi) {
+      df_level$region     <- "sig"
+      df_level$sub_region <- "sig_all"
+      return(df_level)
+    }
+
+    c1 <- max(b1, xlo)   # left edge of the muted region within the panel
+    c2 <- min(b2, xhi)   # right edge of the muted region within the panel
+
+    pieces <- list()
+    add_piece <- function(lo, hi, region, sub) {
+      if (hi <= lo) return(invisible())
+      inside <- df_level[df_level$age_x > lo & df_level$age_x < hi, ]
+      pt_lo  <- interp_at_x(df_level, lo)
+      pt_hi  <- interp_at_x(df_level, hi)
+      seg    <- rbind(pt_lo, inside, pt_hi)
+      if (is.null(seg) || nrow(seg) == 0) return(invisible())
+      seg$region     <- region
+      seg$sub_region <- sub
+      pieces[[length(pieces) + 1]] <<- seg
+    }
+
+    if (b1 > xlo) add_piece(xlo, c1, "sig", "sig_low")
+    add_piece(c1, c2, "nonsig", "nonsig")
+    if (b2 < xhi) add_piece(c2, xhi, "sig", "sig_high")
+
+    do.call(rbind, pieces)
+  }
+
+  pred_df <- rbind(
+    split_level(pred_high, age_bounds),
+    split_level(pred_low,  age_bounds)
+  )
+
+  col_map <- c(
+    "sig.plus_sd"     = col_high_sig,    "sig.minus_sd"     = col_low_sig,
+    "nonsig.plus_sd"  = col_high_nonsig, "nonsig.minus_sd"  = col_low_nonsig
+  )
+  pred_df$style_key <- paste(pred_df$region, pred_df$ctq_level, sep = ".")
+  pred_df$group_key <- paste(pred_df$ctq_level, pred_df$sub_region, sep = ".")
+
+  spag <- data[!is.na(data[[voi]]) & !is.na(data[[ctq_var]]), ]
+  spag <- spag[order(spag$id, spag$age_centered), ]
+  spag$age_x <- if (has_age) spag$age else spag$age_centered
+
+  vline_pos <- if (!is.null(vline_bounds)) vline_bounds else age_bounds
+  vlines <- if (length(vline_pos) >= 1) {
+    geom_vline(xintercept = vline_pos, linetype = "dashed",
+               colour = "grey40", linewidth = 0.4)
+  } else NULL
+
+  ggplot() +
+    vlines +
+    geom_line(data = spag,
+              aes(x = age_x, y = .data[[voi]], group = id),
+              colour = "gray60", alpha = 0.20, linewidth = 0.2) +
+    geom_ribbon(data = pred_df,
+                aes(x = age_x, ymin = ci_lo, ymax = ci_hi,
+                    group = group_key, fill = style_key),
+                alpha = 0.25, colour = NA, na.rm = TRUE) +
+    geom_line(data = pred_df,
+              aes(x = age_x, y = predicted,
+                  group = group_key, colour = style_key, alpha = region),
+              linewidth = 1.1, na.rm = TRUE) +
+    scale_color_manual(values = col_map, guide = "none") +
+    scale_fill_manual( values = col_map, guide = "none") +
+    scale_alpha_manual(values = c("sig" = 1, "nonsig" = 0.3), guide = "none") +
+    scale_x_continuous(breaks = age_x_breaks) +
+    scale_y_continuous(labels = function(x) strip_lead0(x, 2)) +
+    labs(title    = voi_title_html,
+         subtitle = pval_sub_html,
+         x = "Age", y = y_label) +
+    theme_classic(base_size = base_size, base_family = panel_font) +
+    theme(
+      text         = element_text(family = panel_font),
+      plot.title.position = "plot",
+      plot.title   = ggtext::element_markdown(
+                        face = "bold", hjust = 0.5,
+                        family = panel_font, size = SUBPLOT_TITLE_SZ,
+                        margin = margin(b = 6)),
+      plot.subtitle = ggtext::element_markdown(
+                        hjust = 0.5,
+                        family = panel_font, size = SUBPLOT_SUB_SZ,
+                        colour = pval_sub_color,
+                        margin = margin(b = 4)),
+      axis.title.x = element_text(family = panel_font, size = AXIS_TITLE_SZ),
+      axis.title.y = ggtext::element_markdown(family = panel_font,
+                                              size = Y_AXIS_TITLE_SZ),
+      axis.text    = element_text(family = panel_font, size = AXIS_TEXT_SZ),
+      plot.margin  = margin(6, 8, 14, 8)
+    )
+}
+
+make_jn_plot <- function(jn_adv, ctq_var, ctq_label, ctq_abbr, cutoff,
+                         voi, base_size = 11) {
+
+  if (is.null(jn_adv) || is.null(jn_adv$cbands) || nrow(jn_adv$cbands) == 0) {
+    return(ggplot() + theme_void() +
+             annotate("text", x = 0.5, y = 0.5, label = "(J-N unavailable)",
+                      family = panel_font, colour = "grey50", size = 3))
+  }
+
+  cb <- jn_adv$cbands
+
+  modx_col <- names(cb)[1]
+  est_col  <- grep("Slope|Est|estimate|fit", names(cb), value = TRUE)[1]
+  lwr_col  <- grep("Lower|lower|lwr|LCL",    names(cb), value = TRUE)[1]
+  upr_col  <- grep("Upper|upper|upr|UCL",    names(cb), value = TRUE)[1]
+
+  bounds <- as.numeric(jn_adv$bounds)
+  bounds <- bounds[is.finite(bounds)]
+  bounds <- sort(bounds)
+
+  has_nonsig <- length(bounds) >= 2
+  b1 <- if (has_nonsig) bounds[1] else NA_real_
+  b2 <- if (has_nonsig) bounds[length(bounds)] else NA_real_
+
+  in_nonsig_at <- function(x) has_nonsig && x >= b1 && x <= b2
+
+  interp_at <- function(df, x_target) {
+    x <- df[[modx_col]]
+    if (x_target < min(x) || x_target > max(x)) return(NULL)
+    i_lo <- max(which(x <= x_target))
+    i_hi <- min(which(x >= x_target))
+    if (i_lo == i_hi) return(df[i_lo, , drop = FALSE])
+    frac <- (x_target - x[i_lo]) / (x[i_hi] - x[i_lo])
+    row  <- df[i_lo, , drop = FALSE]
+    for (col in c(est_col, lwr_col, upr_col)) {
+      row[[col]] <- df[[col]][i_lo] +
+                    frac * (df[[col]][i_hi] - df[[col]][i_lo])
+    }
+    row[[modx_col]] <- x_target
+    row
+  }
+
+  slope_at <- function(x) {
+    r <- interp_at(cb, x)
+    if (is.null(r)) return(NA_real_)
+    as.numeric(r[[est_col]])
+  }
+  color_at <- function(x) {
+    if (in_nonsig_at(x)) return(jn_col_nonsig)        # grey — non-significant
+    s <- slope_at(x)
+    if (!is.na(s) && s < 0) return(jn_col_high_sig)   # red  — sig negative slope
+    jn_col_low_sig                                     # blue — sig positive slope
+  }
+
+  x_min <- min(cb[[modx_col]], na.rm = TRUE)
+  x_max <- max(cb[[modx_col]], na.rm = TRUE)
+  splits <- c(if (!is.null(cutoff) && is.finite(cutoff)) cutoff else NULL,
+              if (has_nonsig) bounds else NULL)
+  splits <- sort(unique(splits[splits > x_min & splits < x_max]))
+  endpoints <- c(x_min, splits, x_max)
+
+  segments <- list()
+  for (i in seq_len(length(endpoints) - 1)) {
+    xL <- endpoints[i]; xR <- endpoints[i + 1]
+    seg_col <- color_at((xL + xR) / 2)
+    inside  <- cb[cb[[modx_col]] > xL & cb[[modx_col]] < xR, ]
+    pt_L    <- interp_at(cb, xL)
+    pt_R    <- interp_at(cb, xR)
+    seg     <- rbind(pt_L, inside, pt_R)
+    if (nrow(seg) == 0) next
+    seg$seg_id    <- i
+    seg$color_key <- seg_col
+    segments[[length(segments) + 1]] <- seg
+  }
+  seg_df <- do.call(rbind, segments)
+
+  col_map <- c(jn_col_low_sig, jn_col_nonsig, jn_col_high_sig)
+  names(col_map) <- col_map
+
+  p <- ggplot() +
+    geom_ribbon(data = seg_df,
+                aes(x = .data[[modx_col]],
+                    ymin = .data[[lwr_col]],
+                    ymax = .data[[upr_col]],
+                    group = seg_id, fill = color_key),
+                alpha = 0.30, colour = NA, na.rm = TRUE) +
+    geom_line(data = seg_df,
+              aes(x = .data[[modx_col]], y = .data[[est_col]],
+                  group = seg_id, colour = color_key),
+              linewidth = 0.9, na.rm = TRUE) +
+    scale_color_manual(values = col_map, guide = "none") +
+    scale_fill_manual( values = col_map, guide = "none")
+
+  p <- p + geom_hline(yintercept = 0, linetype = "dashed",
+                      colour = "black", linewidth = 0.4)
+  if (has_nonsig) {
+    p <- p + geom_vline(xintercept = bounds, linetype = "dashed",
+                        colour = "grey40", linewidth = 0.4)
+  }
+  if (!is.null(cutoff) && is.finite(cutoff)) {
+    p <- p + geom_vline(xintercept = cutoff, linetype = "solid",
+                        colour = col_cutoff, linewidth = 0.4)
+  }
+
+  short_metric <- voi_subtitle[[voi]]
+  jn_title <- sprintf(
+    "Significant %s &nbsp;Development<br>across %s Severity",
+    short_metric, ctq_abbr
+  )
+  jn_y_lbl <- paste0("Age-Related Slope<br>of ", short_metric)
+
+  p +
+    scale_x_continuous(limits = ctq_x_limits, breaks = ctq_x_breaks,
+                       expand = ctq_x_expand) +
+    scale_y_continuous(
+      breaks = scales::breaks_pretty(n = 4),
+      labels = function(x) strip_lead0(x, 2)
+    ) +
+    labs(x = NULL, y = jn_y_lbl, title = jn_title) +
+    theme_classic(base_size = base_size, base_family = panel_font) +
+    theme(
+      text         = element_text(family = panel_font),
+      plot.title.position = "plot",
+      plot.title   = ggtext::element_markdown(
+                        face = "bold", hjust = 0.5,
+                        family = panel_font, size = SUBPLOT_TITLE_SZ,
+                        lineheight = 1.35,
+                        margin = margin(t = 0, b = 10)),
+      axis.title.x = element_blank(),
+      axis.text.x  = element_text(family = panel_font, size = AXIS_TEXT_SZ,
+                                  colour = "black"),
+      axis.ticks.x = element_line(colour = "black", linewidth = 0.3),
+      axis.line.x  = element_line(colour = "black", linewidth = 0.5),
+      axis.title.y = ggtext::element_markdown(family = panel_font,
+                                              size = Y_AXIS_TITLE_SZ,
+                                              lineheight = 1.1),
+      axis.text.y  = element_text(family = panel_font, size = AXIS_TEXT_SZ),
+      plot.margin  = margin(6, 8, 2, 8)
+    )
+}
+
+
+# Johnson-Neyman analysis of the age slope across levels of the CTQ score
+# (the CTQ score is the "moderator"). Returns the interactions-package result.
+run_jn <- function(model, pred_name, modx_name, alpha = 0.05) {
+  tryCatch(suppressWarnings(eval(bquote(
+    interactions::johnson_neyman(.(model), pred = .(as.name(pred_name)), modx = .(as.name(modx_name)),
+                                 alpha = .(alpha), plot = FALSE)))), error = function(e) NULL)
+}
+
+# Small legends (colored squares with labels), shown in a strip above the figure
+make_line_legend <- function(items, label_size = 2.5, line_lh = 1.0, swatch_size = 3.5) {
+  n  <- length(items); ys <- seq(n, 1)
+  df_pt  <- data.frame(x = 0.18, y = ys, col = vapply(items, `[[`, character(1), "color"))
+  df_txt <- data.frame(x = 0.40, y = ys, label = vapply(items, `[[`, character(1), "label"))
+  ggplot() +
+    geom_point(data = df_pt, aes(x = x, y = y, colour = col), shape = 15, size = swatch_size) +
+    scale_colour_identity() +
+    ggtext::geom_richtext(data = df_txt, aes(x = x, y = y, label = label), hjust = 0, vjust = 0.5,
+                          family = panel_font, size = label_size, lineheight = line_lh,
+                          fill = NA, label.colour = NA, label.padding = unit(0, "pt")) +
+    scale_x_continuous(limits = c(0, 2.0)) + scale_y_continuous(limits = c(0.5, n + 0.5)) +
+    coord_cartesian(clip = "off") + theme_void() +
+    theme(text = element_text(family = panel_font), plot.margin = margin(4, 6, 4, 6))
+}
+legend_traj <- make_line_legend(list(list(color = col_low_sig, label = "low adversity"),
+                                     list(color = col_high_sig, label = "high adversity")))
+legend_jn   <- make_line_legend(list(list(color = jn_col_low_sig, label = "sig. positive<br>development"),
+                                     list(color = jn_col_high_sig, label = "sig. negative<br>development")),
+                                line_lh = 1.1)
+
+# One complete panel: title + trajectory plot + Johnson-Neyman plot + arrow
+img_w <- 4; img_h <- 5.55                 # size (inches) of one panel in the paper's figure
+make_figure_panel <- function(k, voi) {
+  ctq_raw   <- predictors[k, "raw"]       # raw CTQ score (so J-N and axes are on the CTQ-score scale)
+  ctq_label <- predictors[k, "name"]; ctq_abbr <- predictors[k, "abbr"]
+  # Model 4 with the raw CTQ score (otherwise identical to the model used in the tables)
+  quad <- fits[[k]][[voi]]$use_quadratic
+  f4 <- if (quad) paste(voi, "~ age_centered *", ctq_raw, "+ age_squared *", ctq_raw, "+", covariates, "+", random_fx)
+        else      paste(voi, "~ age_centered *", ctq_raw, "+", covariates, "+", random_fx)
+  M4 <- fit_lmm(f4, dat)$model
+  raw_p <- fixed_effects(M4); raw_p <- raw_p$p[raw_p$term == paste0("age_centered:", ctq_raw)]
+  fdr_p <- fdr[[k]]["age", voi]
+  p_traj <- make_trajectory_plot(M4 = M4, voi = voi, y_label = panel_y_labels[[voi]], ctq_var = ctq_raw,
+                                 ctq_label = ctq_label, ctq_abbr = ctq_abbr, raw_p = raw_p, fdr_p = fdr_p,
+                                 age_bounds = numeric(0), vline_bounds = NULL, sd_mult = 1, base_size = 11)
+  p_jn  <- make_jn_plot(jn_adv = run_jn(M4, "age_centered", ctq_raw), ctq_var = ctq_raw, ctq_label = ctq_label,
+                        ctq_abbr = ctq_abbr, cutoff = cutoffs[[k]], voi = voi, base_size = 11)
+  p_bar <- make_xbar_plot(cutoff = cutoffs[[k]], ctq_abbr = ctq_abbr, base_size = 11)
+  metric_symbol <- if (grepl("LastBlock", voi)) "last block" else voi_subtitle[[voi]]
+  title_html <- sprintf("Effect of %s (%s)<br>on %s (%s)", ctq_label, ctq_abbr, voi_full_name[[voi]], metric_symbol)
+  title_theme <- theme(plot.title = ggtext::element_markdown(face = "bold", hjust = 0.5, family = panel_font,
+                                                              size = TITLE_SZ, lineheight = 1.35, margin = margin(b = 14)))
+  p_traj / p_jn / p_bar + plot_layout(heights = c(1, 1, 0.20)) +
+    plot_annotation(title = title_html, theme = title_theme)
+}
+# Moderate-severity CTQ cutoffs (Bernstein & Fink, 1998)
+cutoffs <- c(EA = 13, PA = 10, SA = 8, EN = 15, PN = 10)
+```
+
+```{r figure1, fig.width = 12, fig.height = 6.45, dpi = 150}
+# The three effects that survive FDR correction (panels A, B, C)
+panel_A <- make_figure_panel("EA", "Apun_qnormed")
+panel_B <- make_figure_panel("PA", "betaB")
+panel_C <- make_figure_panel("PA", "good_proportion_LastBlock")
+# Legends are printed in their own strip above the three panels
+legend_strip <- plot_spacer() | legend_traj | legend_jn | plot_spacer()
+panels_row   <- wrap_elements(full = panel_A) | wrap_elements(full = panel_B) | wrap_elements(full = panel_C)
+print(legend_strip / panels_row + plot_layout(heights = c(0.9, 5.55)))
+```
+
+## Supplemental Table 1. Demographic information and descriptive statistics across all five timepoints
+
+For each timepoint: sample size, mean (SD) or percentage for demographics and, at Timepoint 1 only, the CTQ subscale scores, the Minimization/Denial scale, and the association of each demographic variable with the CTQ Total score (linear regression for age and IQ; logistic regression for sex and racial minority status).
+
+```{r supp-table1}
+waves <- c("T1", "T2", "T3", "T4", "T5")
+mean_sd <- function(x) sprintf("%.2f (%.2f)", mean(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+pct     <- function(x) sprintf("%.1f%%", 100 * mean(x, na.rm = TRUE))
+t1 <- dat[dat$time == "T1", ]
+# Associations with CTQ Total score at baseline (age and IQ: linear regression;
+# sex: logistic regression of sex on CTQ Total)
+m_age <- summary(lm(ctq_tot_avg ~ age, data = t1))$coefficients["age", ]
+m_iq  <- summary(lm(ctq_tot_avg ~ NonVerbal_Std, data = t1))$coefficients["NonVerbal_Std", ]
+m_sex <- summary(glm(child_sex ~ ctq_tot_avg, family = binomial, data = t1))$coefficients["ctq_tot_avg", ]
+# Racial minority (any race other than White = 1) among participants who reported race
+t1$minority <- ifelse(t1$race_T1 == 1, 0, ifelse(t1$race_T1 >= 2, 1, NA))
+m_race <- summary(glm(minority ~ ctq_tot_avg, family = binomial, data = t1))$coefficients["ctq_tot_avg", ]
+n_race <- sum(!is.na(t1$minority))                    # participants reporting race
+race_pct <- function(codes) sprintf("%.1f%%", 100 * sum(t1$race_T1 %in% codes) / n_race)
+assoc <- function(b, p) sprintf("β = %.2f; p = %s", b, fp(p))
+# One table row: a label, one value per timepoint, and (optionally) the association
+by_wave <- function(label, fun, assoc_text = "") c(label, sapply(waves, function(w) fun(dat[dat$time == w, ])), assoc_text)
+t1_only <- function(label, value, assoc_text = "") c(label, value, "", "", "", "", assoc_text)
+blank   <- function(label) c(paste0("<b>", label, "</b>"), rep("", 6))
+mdr <- t1$ctq_mdr_T1[!is.na(t1$ctq_mdr_T1)]        # Minimization/Denial score (0-3)
+tab <- rbind(
+  by_wave("N participants", function(d) as.character(nrow(d))),
+  by_wave("Age (years), mean (SD)", function(d) mean_sd(d$age), assoc(m_age["Estimate"], m_age["Pr(>|t|)"])),
+  by_wave("Sex assigned at birth (female)", function(d) pct(d$child_sex == 1), assoc(m_sex["Estimate"], m_sex["Pr(>|z|)"])),
+  by_wave("K-BIT nonverbal IQ, mean (SD)", function(d) mean_sd(d$NonVerbal_Std), assoc(m_iq["Estimate"], m_iq["Pr(>|t|)"])),
+  by_wave("In-lab administration (E-Prime)", function(d) pct(d$eprime == 1)),
+  t1_only("Racial minority (non-White)", sprintf("%.0f%% (of %.0f%% reporting race)", 100 * mean(t1$minority, na.rm = TRUE), 100 * n_race / nrow(t1)),
+          assoc(m_race["Estimate"], m_race["Pr(>|z|)"])),
+  blank("Racial breakdown among those reporting race"),
+  t1_only("   White", race_pct(1)),
+  t1_only("   Black/African American", race_pct(2)),
+  t1_only("   Asian", race_pct(3)),
+  t1_only("   Multiracial", race_pct(6)),
+  t1_only("   Other", race_pct(7)),
+  blank("CTQ subscale scores, mean (SD)"),
+  t1_only("   Emotional Neglect (EN)", mean_sd(t1$ctq_EN_T1_avg)),
+  t1_only("   Emotional Abuse (EA)",   mean_sd(t1$ctq_EA_T1_avg)),
+  t1_only("   Physical Abuse (PA)",    mean_sd(t1$ctq_PA_T1_avg)),
+  t1_only("   Physical Neglect (PN)",  mean_sd(t1$ctq_PN_T1_avg)),
+  t1_only("   Sexual Abuse (SA)",      mean_sd(t1$ctq_SA_T1_avg)),
+  blank("CTQ Minimization/Denial scale: % of participants at each score"),
+  t(sapply(0:3, function(s) t1_only(paste0("   score = ", s), sprintf("%.1f%%", 100 * mean(mdr == s))))))
+tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+names(tab) <- c("Variable", "Timepoint 1", "Timepoint 2", "Timepoint 3", "Timepoint 4", "Timepoint 5",
+                "Association with CTQ Total score (Timepoint 1)")
+show_table(tab)
+```
+
+## Supplemental Table 2. Sample descriptive statistics related to the CTQ subscales
+
+Participants (n = 166) are counted using baseline CTQ subscale scores. "Above the minimum" = any endorsement (score > 5). "+1 SD" = more than one standard deviation above the sample mean. Clinical cutoffs are the moderate-to-severe cutoffs of Bernstein & Fink (1998). "Observations" = participant-waves (out of 528) contributed by participants above the minimum.
+
+```{r supp-table2}
+cutoffs <- c(EA = 13, PA = 10, SA = 8, EN = 15, PN = 10)
+rows <- lapply(subscales, function(k) {
+  v     <- t1[[predictors[k, "raw"]]]
+  above <- t1$id[v > 5]
+  c(predictors[k, "title"],
+    sprintf("%d (%.0f%%)", sum(v > 5), 100 * mean(v > 5)),
+    sum(v > mean(v) + sd(v)),
+    sprintf("%d (cutoff ≥ %d)", sum(v >= cutoffs[k]), cutoffs[k]),
+    sum(dat$id %in% above))
+})
+tab <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+names(tab) <- c("CTQ scale", "Participants above the minimum score (any endorsement)", "Participants above +1 SD",
+                "Participants at or above clinical cutoff", "Observations contributed by participants above the minimum")
+show_table(tab)
+```
+
+## Supplemental Table 4. Model recovery for the one- versus two-learning-rate PoP-ORL models
+
+Not reproduced here: model recovery requires simulating data and fitting the Stan models. Code available upon request.
+
+## Supplemental Table 5. Baseline correlations among the CTQ adversity predictors, covariates, and learning metrics
+
+Pearson correlations at baseline (T1; n = 166). Stars mark uncorrected p-values (* p < .05, ** p < .01, *** p < .001). Sex is coded 0 = male, 1 = female.
+
+```{r corr-functions}
+# Pearson correlation between two variables, formatted ".65***"
+cor_cell <- function(x, y) {
+  ok <- complete.cases(x, y)
+  ct <- cor.test(x[ok], y[ok])
+  paste0(f2(unname(ct$estimate)), stars(ct$p.value))
+}
+# Correlation table: rows and columns are named vectors (variable name = label).
+# lower_only = TRUE shows only the lower triangle (for a variable with itself).
+cor_table <- function(rows, cols, lower_only = FALSE) {
+  m <- matrix("", length(rows), length(cols), dimnames = list(unname(rows), unname(cols)))
+  for (i in seq_along(rows)) for (j in seq_along(cols)) {
+    if (lower_only && j >= i) { m[i, j] <- if (i == j) "—" else ""; next }
+    m[i, j] <- cor_cell(t1[[names(rows)[i]]], t1[[names(cols)[j]]])
+  }
+  out <- data.frame(Variable = rownames(m), m, check.names = FALSE, row.names = NULL)
+  out
+}
+ctq_vars <- setNames(c("Abuse Composite", "Neglect Composite", "Emotional Abuse", "Physical Abuse",
+                       "Sexual Abuse", "Emotional Neglect", "Physical Neglect"), predictors$raw)
+cov_vars <- c(age = "Age (years)", NonVerbal_Std = "Nonverbal IQ (K-BIT)", child_sex = "Sex (0 = male, 1 = female)")
+learn_vars <- setNames(c("Good Deck Proportion", "Bad Deck Proportion", "Net Performance", "Go Bias (βb)",
+                         "Reward Learning Rate (Arew)", "Punishment Learning Rate (Apun)",
+                         "Averaged Single Learning Rate ((Arew + Apun)/2)", "Win/Loss Frequency Sensitivity (βf)"),
+                       names(outcomes))
+```
+
+### Supplemental Table 5.1. Correlations among the CTQ adversity predictors and covariates
+
+```{r supp-table5-1}
+all_51 <- c(ctq_vars, cov_vars)
+rows_51 <- setNames(paste0(seq_along(all_51), ". ", all_51), names(all_51))
+tab <- cor_table(rows_51, setNames(seq_along(all_51), names(all_51)), lower_only = TRUE)
+show_table(tab)
+```
+
+### Supplemental Table 5.2. Correlations between the CTQ adversity predictors and the learning metrics
+
+```{r supp-table5-2}
+show_table(cor_table(ctq_vars, learn_vars))
+```
+
+### Supplemental Table 5.3. Correlations among the learning metrics
+
+```{r supp-table5-3}
+rows_53 <- setNames(paste0(seq_along(learn_vars), ". ", learn_vars), names(learn_vars))
+show_table(cor_table(rows_53, setNames(seq_along(learn_vars), names(learn_vars)), lower_only = TRUE))
+```
+
+## Supplemental Table 6. Mean percentage of "plays" for each deck across each wave
+
+Mean (SD) percentage of each deck's 30 cards that participants chose to play, by wave (participant-wave level).
+
+```{r supp-table6}
+deck_vars <- c(deckA_proportion = "Deck A: bad, frequent losses", deckB_proportion = "Deck B: bad, infrequent losses",
+               deckC_proportion = "Deck C: good, frequent losses", deckD_proportion = "Deck D: good, infrequent losses")
+tab <- data.frame(Deck = unname(deck_vars))
+for (w in waves) {
+  d <- dat[dat$time == w, ]
+  tab[[w]] <- sapply(names(deck_vars), function(v) sprintf("%.1f%% (%.1f)", 100 * mean(d[[v]]), 100 * sd(d[[v]])))
+}
+show_table(tab)
+```
+
+## Supplemental Figure 1. Distribution of "plays" for each deck across each wave
+
+Bars show the percentage of participants at each wave in each 10-point bin of the proportion of the deck's cards played.
+
+```{r supp-figure1, fig.width = 7, fig.height = 6.5}
+# One row per participant-wave-deck
+long <- do.call(rbind, lapply(names(deck_vars), function(v) {
+  data.frame(time = dat$time, Deck = sub(":.*", "", deck_vars[[v]]), prop = dat[[v]])
+}))
+long$bin <- cut(long$prop, breaks = seq(0, 1, .1), include.lowest = TRUE, labels = FALSE)
+long$mid <- (long$bin - .5) / 10
+hist_dat <- as.data.frame(table(time = long$time, Deck = long$Deck, mid = long$mid))
+hist_dat$mid <- as.numeric(as.character(hist_dat$mid))
+hist_dat$pct <- hist_dat$Freq / ave(hist_dat$Freq, hist_dat$time, hist_dat$Deck, FUN = sum)
+n_wave <- table(dat$time)
+hist_dat$wave <- paste0(hist_dat$time, " (n = ", n_wave[as.character(hist_dat$time)], ")")
+print(ggplot(hist_dat, aes(mid, pct)) +
+        geom_col(width = .1, fill = "grey55", colour = "white") +
+        facet_grid(wave ~ Deck) +
+        scale_x_continuous(labels = scales::percent, breaks = c(0, .5, 1)) +
+        scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+        labs(x = "Proportion of the deck's cards played", y = "% of participants at the wave") +
+        theme_classic(base_size = 9))
+```
+
+## Supplemental Table 7. Relationship between the learning parameters and Net Performance
+
+Change in Net Performance (last block, percentage points) per 1 SD higher parameter, from multilevel models adjusted for age, nonverbal IQ, sex, and administration mode. "Alone" = each parameter entered by itself; "Together" = all four parameters entered together.
+
+```{r supp-table7}
+d7 <- dat
+d7$net_performance <- 100 * d7$net_good_bad_LastBlock          # percentage points
+params <- c(Arew_qnormed = "Reward Learning Rate (Arew)", Apun_qnormed = "Punishment Learning Rate (Apun)",
+            betaF = "Win/Loss Frequency Sensitivity (βf)", betaB = "Go Bias (βb)")
+for (v in names(params)) d7[[paste0(v, "_z")]] <- as.numeric(scale(d7[[v]]))   # standardize
+z_names <- paste0(names(params), "_z")
+# Model with all four parameters together
+m_together <- fit_lmm(paste("net_performance ~ age_centered +", covariates, "+",
+                            paste(z_names, collapse = " + "), "+", random_fx), d7)$model
+together <- fixed_effects(m_together)
+# Models with one parameter at a time
+alone <- do.call(rbind, lapply(z_names, function(z) {
+  m <- fit_lmm(paste("net_performance ~ age_centered +", covariates, "+", z, "+", random_fx), d7)$model
+  fe <- fixed_effects(m); fe[fe$term == z, ]
+}))
+together <- together[match(z_names, together$term), ]
+fmt_b_ci <- function(r) sprintf("%.2f [%.2f, %.2f]", r$est, r$lo, r$hi)
+tab <- data.frame(`Learning Parameter` = unname(params),
+                  `Alone: b [95% CI]` = fmt_b_ci(alone), `p-value` = fp(alone$p),
+                  `Together: b [95% CI]` = fmt_b_ci(together), `p-value ` = fp(together$p),
+                  check.names = FALSE)
+show_table(tab)
+# Variance explained by fixed effects (marginal R2): covariates only vs. with the four parameters
+m_null <- fit_lmm(paste("net_performance ~ age_centered +", covariates, "+", random_fx), d7)$model
+knitr::asis_output(sprintf("Marginal R² = %.1f%% for the model with age and covariates only and %.1f%% with the four learning parameters.\n\n",
+            100 * r.squaredGLMM(m_null)[1, "R2m"], 100 * r.squaredGLMM(m_together)[1, "R2m"]))
+```
+
+## Supplemental Figure 2. Influence of model parameters on choice behavior and task performance
+
+Not reproduced here: this figure comes from simulating choices from the PoP-ORL model, which requires running Stan code. Code available upon request.
+
+## Supplemental Table 8. Summary of unconditional growth models
+
+Age effects from the unconditional growth models (age only, no covariates) for the proportion of cards played from each deck, the traditional scores (last block and full task), and the model-based metrics. Age² is shown only where the quadratic model was retained (likelihood-ratio test, p < .05). FDR correction is across the eight primary metrics (Age: eight linear tests; Age²: eight curvature tests); deck-level models are uncorrected.
+
+```{r supp-table8}
+# Outcomes in table order (deck, last block, full task, model-based)
+t8_outcomes <- c(deckA_proportion = "Deck A: bad, frequent losses", deckB_proportion = "Deck B: bad, infrequent losses",
+                 deckC_proportion = "Deck C: good, frequent losses", deckD_proportion = "Deck D: good, infrequent losses",
+                 good_proportion_LastBlock = "Good Deck Proportion", bad_proportion_LastBlock = "Bad Deck Proportion",
+                 net_good_bad_LastBlock = "Net Performance",
+                 good_proportion = "Good Deck Proportion", bad_proportion = "Bad Deck Proportion", net_good_bad = "Net Performance",
+                 betaB = "Go Bias (βb)", Arew_qnormed = "Reward Learning Rate (Arew)",
+                 Apun_qnormed = "Punishment Learning Rate (Apun)",
+                 Overall_A = "Averaged Single Learning Rate ((Arew + Apun)/2)", betaF = "Win/Loss Frequency Sensitivity (βf)")
+gs8 <- lapply(setNames(names(t8_outcomes), names(t8_outcomes)), function(y) growth_shape(y, dat))
+# p-value of the age^2 term from the quadratic model, for every outcome (for FDR)
+p_quad <- sapply(gs8, function(g) summary(g$r2$model)$coefficients["age_squared", "Pr(>|t|)"])
+p_age  <- sapply(gs8, function(g) {
+  m <- if (g$use_quadratic) g$r2$model else g$r1$model
+  summary(m)$coefficients["age_centered", "Pr(>|t|)"]
+})
+# FDR families: (last-block traditional + model-based) and (full-task traditional + model-based)
+rl <- names(outcomes)[4:8]
+fam_last <- c(names(outcomes)[1:3], rl)
+fam_full <- c(names(fulltask_outcomes), rl)
+# Adjusted p-values: first within the last-block family, then replace the three
+# traditional metrics by their full-task versions (the model-based metrics keep
+# their last-block-family values, as in the paper's table).
+q_age <- q_quad <- setNames(rep(NA_real_, length(gs8)), names(gs8))
+q_age[fam_last]  <- p.adjust(p_age[fam_last], "BH");  q_quad[fam_last] <- p.adjust(p_quad[fam_last], "BH")
+qa_full <- p.adjust(p_age[fam_full], "BH");           qq_full <- p.adjust(p_quad[fam_full], "BH")
+q_age[names(fulltask_outcomes)]  <- qa_full[names(fulltask_outcomes)]
+q_quad[names(fulltask_outcomes)] <- qq_full[names(fulltask_outcomes)]
+
+fmt_row <- function(y, term) {
+  g  <- gs8[[y]]
+  m  <- if (g$use_quadratic) g$r2$model else g$r1$model
+  tm <- if (term == "Age") "age_centered" else "age_squared"
+  if (!tm %in% rownames(summary(m)$coefficients)) return(NULL)
+  fe <- fixed_effects(m); r <- fe[fe$term == tm, ]
+  q  <- if (y %in% names(t8_outcomes)[1:4]) "—" else fp(if (term == "Age") q_age[y] else q_quad[y])
+  c(t8_outcomes[[y]], term, f3(r$est), sprintf("[%s – %s]", f3(r$lo), f3(r$hi)), fp(r$p), q)
+}
+section <- function(txt) c(paste0("<b>", txt, "</b>"), "", "", "", "", "")
+rows <- list(section("Proportion of cards played from each deck (computed from all trials of the task)"))
+add_rows <- function(ys) for (y in ys) for (tm in c("Age", "Age²")) { r <- fmt_row(y, tm); if (!is.null(r)) rows[[length(rows) + 1]] <<- r }
+add_rows(names(t8_outcomes)[1:4])
+rows[[length(rows) + 1]] <- section("Traditional scoring metrics (computed from the last block of the task)")
+add_rows(names(t8_outcomes)[5:7])
+rows[[length(rows) + 1]] <- section("Traditional scoring metrics (computed from all trials of the task; sensitivity analysis)")
+add_rows(names(t8_outcomes)[8:10])
+rows[[length(rows) + 1]] <- section("PoP-ORL model-based metrics")
+add_rows(names(t8_outcomes)[11:15])
+tab <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+names(tab) <- c("Outcome", "Effect", "b", "95% CI", "p-value", "FDR p-value")
+show_table(tab)
+```
+
+## Supplemental Table 9. Full nested model results
+
+Models 1-4 for each learning metric and each CTQ predictor (56 sub-tables, 9.1-9.56). Model 1 = unconditional linear growth; Model 2 = unconditional quadratic growth; Model 3 = winning growth shape plus covariates (nonverbal IQ, sex, administration mode); Model 4 = Model 3 plus the CTQ predictor and its interaction with age (and age² if the quadratic shape won). Cells show unstandardized b, uncorrected significance stars (* p < .05, ** p < .01, *** p < .001), and the 95% CI. A "—" in the τ₁₁ row means the random age slope was dropped because the fit was singular. J-N = Johnson-Neyman: CTQ scores (raw scale) at which the age slope is significant, shown for age interactions with p < .05.
+
+```{r table9-function}
+# Builds one Supplemental Table 9 sub-table: the Model 1-4 results for one CTQ
+# predictor (pred_key, e.g. "EA") and one learning metric (outcome).
+show_table9 <- function(pred_key, outcome) {
+  f   <- fits[[pred_key]][[outcome]]
+  P   <- predictors[pred_key, ]
+  cv  <- P$centered
+  mods <- list(f$M1, f$M2, f$M3, f$M4)
+  slope_dropped <- f$slope_dropped
+  fes <- lapply(mods, fixed_effects)
+  dash <- "—"
+
+  # Cell for a fixed effect (est, stars, CI), or "—" if the term is not in the model
+  fe_cell <- function(i, term) {
+    r <- fes[[i]][fes[[i]]$term == term, ]
+    if (nrow(r) == 0) return(dash)
+    s <- stars(r$p)
+    sprintf("%s%s\n[%s – %s]", f3(r$est), ifelse(s == "", "", paste0(" ", s)), f3(r$lo), f3(r$hi))
+  }
+  # Rows of fixed effects: label and term name
+  terms <- list(c("Constant", "(Intercept)"), c("Age", "age_centered"), c("Age²", "age_squared"),
+                c("K-BIT Nonverbal Standard IQ", "NonVerbal_Std_centered"), c("Child Sex", "child_sex"),
+                c("On-site Administration", "eprime"),
+                c(paste(P$abbr, "Baseline Effect"), ctq_terms(cv)[["baseline"]]),
+                c(paste("Age ×", P$name), ctq_terms(cv)[["age"]]))
+  rows <- list()
+  rows[[length(rows) + 1]] <- c("<b>Fixed Effects</b>", "", "", "", "")
+  for (t in terms) {
+    rows[[length(rows) + 1]] <- c(t[1], sapply(1:4, function(i) fe_cell(i, t[2])))
+    # Johnson-Neyman row under the age interaction when it is significant (p < .05)
+    if (t[2] == ctq_terms(cv)[["age"]] && term_p(f, "age") < .05) {
+      rows[[length(rows) + 1]] <- c("J-N Adversity Levels of Sig", dash, dash, dash, jn_text(f$M4, cv))
+    }
+  }
+  if (f$use_quadratic) rows[[length(rows) + 1]] <- c(paste("Age² ×", P$name), dash, dash, dash, fe_cell(4, ctq_terms(cv)[["age2"]]))
+
+  # Random effects
+  res <- Map(function(m, sd) random_effects(m, sd), mods, slope_dropped)
+  rows[[length(rows) + 1]] <- c("<b>Random Effects</b>", "", "", "", "")
+  rows[[length(rows) + 1]] <- c("σ²", sapply(res, function(r) sprintf("%.2f", r$sigma2)))
+  rows[[length(rows) + 1]] <- c("τ₀₀ (id)", sapply(res, function(r) sprintf("%.2f", r$tau00)))
+  rows[[length(rows) + 1]] <- c("τ₁₁ (id.age)", mapply(function(r, sd) if (sd) dash else sprintf("%.2f", r$tau11), res, slope_dropped))
+  rows[[length(rows) + 1]] <- c("N (id)", rep(as.character(ngrps(f$M4)[["id"]]), 4))
+
+  # Fit statistics
+  rows[[length(rows) + 1]] <- c("<b>Fit Statistics</b>", "", "", "", "")
+  ll <- sapply(mods, function(m) as.numeric(logLik(m)))
+  rows[[length(rows) + 1]] <- c("AIC", sprintf("%.1f", sapply(mods, AIC)))
+  rows[[length(rows) + 1]] <- c("BIC", sprintf("%.1f", sapply(mods, BIC)))
+  rows[[length(rows) + 1]] <- c("Log-Likelihood", sprintf("%.1f", ll))
+  rows[[length(rows) + 1]] <- c("Deviance", sprintf("%.1f", -2 * ll))
+
+  # Model comparisons (likelihood-ratio tests)
+  lrt_text <- function(a) sprintf("χ²(%d) = %.2f%s", a$Df[2], a$Chisq[2], ifelse(stars(a$`Pr(>Chisq)`[2]) == "", "", paste0(" ", stars(a$`Pr(>Chisq)`[2]))))
+  rows[[length(rows) + 1]] <- c("<b>Model Comparisons</b>", "", "", "", "")
+  rows[[length(rows) + 1]] <- c("Compared to Model 1", "", lrt_text(f$lrt_12),
+                                if (!f$use_quadratic) lrt_text(f$lrt_ref3) else "",
+                                if (!f$use_quadratic) lrt_text(f$lrt_ref4) else "")
+  rows[[length(rows) + 1]] <- c("Compared to Model 2", "", "", if (f$use_quadratic) lrt_text(f$lrt_ref3) else "",
+                                if (f$use_quadratic) lrt_text(f$lrt_ref4) else "")
+  rows[[length(rows) + 1]] <- c("Compared to Model 3", "", "", "", lrt_text(f$lrt_34))
+
+  # Intraclass correlation and R-squared
+  rr <- lapply(mods, r2)
+  rows[[length(rows) + 1]] <- c("ICC", sprintf("%.2f", sapply(mods, icc)))
+  rows[[length(rows) + 1]] <- c("Conditional R²", sprintf("%.2f", sapply(rr, function(x) x["R2c"])))
+  rows[[length(rows) + 1]] <- c("Marginal R²",    sprintf("%.2f", sapply(rr, function(x) x["R2m"])))
+
+  tab <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+  names(tab) <- c("", "Model 1", "Model 2", "Model 3", "Model 4")
+  show_table(tab)
+}
+```
+
+### Supplemental Table 9.1. Good Deck Proportion (Last Block) Predicted by Abuse Composite
+
+```{r supp-table9-1}
+show_table9("A", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.2. Bad Deck Proportion (Last Block) Predicted by Abuse Composite
+
+```{r supp-table9-2}
+show_table9("A", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.3. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Abuse Composite
+
+```{r supp-table9-3}
+show_table9("A", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.4. Go Bias (βb) Predicted by Abuse Composite
+
+```{r supp-table9-4}
+show_table9("A", "betaB")
+```
+
+### Supplemental Table 9.5. Reward Learning Rate (Arew) Predicted by Abuse Composite
+
+```{r supp-table9-5}
+show_table9("A", "Arew_qnormed")
+```
+
+### Supplemental Table 9.6. Punishment Learning Rate (Apun) Predicted by Abuse Composite
+
+```{r supp-table9-6}
+show_table9("A", "Apun_qnormed")
+```
+
+### Supplemental Table 9.7. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Abuse Composite
+
+```{r supp-table9-7}
+show_table9("A", "Overall_A")
+```
+
+### Supplemental Table 9.8. Win/Loss Frequency Sensitivity (βf) Predicted by Abuse Composite
+
+```{r supp-table9-8}
+show_table9("A", "betaF")
+```
+
+### Supplemental Table 9.9. Good Deck Proportion (Last Block) Predicted by Neglect Composite
+
+```{r supp-table9-9}
+show_table9("N", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.10. Bad Deck Proportion (Last Block) Predicted by Neglect Composite
+
+```{r supp-table9-10}
+show_table9("N", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.11. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Neglect Composite
+
+```{r supp-table9-11}
+show_table9("N", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.12. Go Bias (βb) Predicted by Neglect Composite
+
+```{r supp-table9-12}
+show_table9("N", "betaB")
+```
+
+### Supplemental Table 9.13. Reward Learning Rate (Arew) Predicted by Neglect Composite
+
+```{r supp-table9-13}
+show_table9("N", "Arew_qnormed")
+```
+
+### Supplemental Table 9.14. Punishment Learning Rate (Apun) Predicted by Neglect Composite
+
+```{r supp-table9-14}
+show_table9("N", "Apun_qnormed")
+```
+
+### Supplemental Table 9.15. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Neglect Composite
+
+```{r supp-table9-15}
+show_table9("N", "Overall_A")
+```
+
+### Supplemental Table 9.16. Win/Loss Frequency Sensitivity (βf) Predicted by Neglect Composite
+
+```{r supp-table9-16}
+show_table9("N", "betaF")
+```
+
+### Supplemental Table 9.17. Good Deck Proportion (Last Block) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-17}
+show_table9("EA", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.18. Bad Deck Proportion (Last Block) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-18}
+show_table9("EA", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.19. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-19}
+show_table9("EA", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.20. Go Bias (βb) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-20}
+show_table9("EA", "betaB")
+```
+
+### Supplemental Table 9.21. Reward Learning Rate (Arew) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-21}
+show_table9("EA", "Arew_qnormed")
+```
+
+### Supplemental Table 9.22. Punishment Learning Rate (Apun) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-22}
+show_table9("EA", "Apun_qnormed")
+```
+
+### Supplemental Table 9.23. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-23}
+show_table9("EA", "Overall_A")
+```
+
+### Supplemental Table 9.24. Win/Loss Frequency Sensitivity (βf) Predicted by Emotional Abuse (EA)
+
+```{r supp-table9-24}
+show_table9("EA", "betaF")
+```
+
+### Supplemental Table 9.25. Good Deck Proportion (Last Block) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-25}
+show_table9("PA", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.26. Bad Deck Proportion (Last Block) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-26}
+show_table9("PA", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.27. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-27}
+show_table9("PA", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.28. Go Bias (βb) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-28}
+show_table9("PA", "betaB")
+```
+
+### Supplemental Table 9.29. Reward Learning Rate (Arew) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-29}
+show_table9("PA", "Arew_qnormed")
+```
+
+### Supplemental Table 9.30. Punishment Learning Rate (Apun) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-30}
+show_table9("PA", "Apun_qnormed")
+```
+
+### Supplemental Table 9.31. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-31}
+show_table9("PA", "Overall_A")
+```
+
+### Supplemental Table 9.32. Win/Loss Frequency Sensitivity (βf) Predicted by Physical Abuse (PA)
+
+```{r supp-table9-32}
+show_table9("PA", "betaF")
+```
+
+### Supplemental Table 9.33. Good Deck Proportion (Last Block) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-33}
+show_table9("SA", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.34. Bad Deck Proportion (Last Block) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-34}
+show_table9("SA", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.35. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-35}
+show_table9("SA", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.36. Go Bias (βb) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-36}
+show_table9("SA", "betaB")
+```
+
+### Supplemental Table 9.37. Reward Learning Rate (Arew) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-37}
+show_table9("SA", "Arew_qnormed")
+```
+
+### Supplemental Table 9.38. Punishment Learning Rate (Apun) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-38}
+show_table9("SA", "Apun_qnormed")
+```
+
+### Supplemental Table 9.39. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-39}
+show_table9("SA", "Overall_A")
+```
+
+### Supplemental Table 9.40. Win/Loss Frequency Sensitivity (βf) Predicted by Sexual Abuse (SA)
+
+```{r supp-table9-40}
+show_table9("SA", "betaF")
+```
+
+### Supplemental Table 9.41. Good Deck Proportion (Last Block) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-41}
+show_table9("EN", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.42. Bad Deck Proportion (Last Block) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-42}
+show_table9("EN", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.43. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-43}
+show_table9("EN", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.44. Go Bias (βb) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-44}
+show_table9("EN", "betaB")
+```
+
+### Supplemental Table 9.45. Reward Learning Rate (Arew) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-45}
+show_table9("EN", "Arew_qnormed")
+```
+
+### Supplemental Table 9.46. Punishment Learning Rate (Apun) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-46}
+show_table9("EN", "Apun_qnormed")
+```
+
+### Supplemental Table 9.47. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-47}
+show_table9("EN", "Overall_A")
+```
+
+### Supplemental Table 9.48. Win/Loss Frequency Sensitivity (βf) Predicted by Emotional Neglect (EN)
+
+```{r supp-table9-48}
+show_table9("EN", "betaF")
+```
+
+### Supplemental Table 9.49. Good Deck Proportion (Last Block) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-49}
+show_table9("PN", "good_proportion_LastBlock")
+```
+
+### Supplemental Table 9.50. Bad Deck Proportion (Last Block) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-50}
+show_table9("PN", "bad_proportion_LastBlock")
+```
+
+### Supplemental Table 9.51. Net Performance (Good Proportion – Bad Proportion) (Last Block) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-51}
+show_table9("PN", "net_good_bad_LastBlock")
+```
+
+### Supplemental Table 9.52. Go Bias (βb) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-52}
+show_table9("PN", "betaB")
+```
+
+### Supplemental Table 9.53. Reward Learning Rate (Arew) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-53}
+show_table9("PN", "Arew_qnormed")
+```
+
+### Supplemental Table 9.54. Punishment Learning Rate (Apun) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-54}
+show_table9("PN", "Apun_qnormed")
+```
+
+### Supplemental Table 9.55. Averaged Single Learning Rate ((Arew + Apun)/2) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-55}
+show_table9("PN", "Overall_A")
+```
+
+### Supplemental Table 9.56. Win/Loss Frequency Sensitivity (βf) Predicted by Physical Neglect (PN)
+
+```{r supp-table9-56}
+show_table9("PN", "betaF")
+```
+
+
+## Supplemental Table 10. Summary of dimensional adversity effects
+
+Model 4 results for the abuse and neglect composites: effects on the intercept (baseline effect) and on development (interaction with age). Stars = uncorrected p-values. No effect survives FDR correction (none in bold).
+
+```{r supp-table10}
+fdr_comp <- lapply(setNames(c("A", "N"), c("A", "N")), function(k) fdr[[k]])
+tab <- summary_table(c("A", "N"), fits, fdr_comp, names(outcomes))
+show_table(tab)
+```
+
+## Supplemental Table 11. Summary of the full model effects for the traditional scoring metrics computed from the full task
+
+Same as the main-text Table 3 for the three traditional scoring metrics, computed from all trials of the task instead of only the last block. FDR correction is across the three full-task traditional metrics plus the five model-based metrics.
+
+```{r supp-table11}
+tab <- summary_table(subscales, fits_full, fdr_full, names(fulltask_outcomes))
+show_table(tab)
+```
+
+## Supplemental Table 12. Specificity analyses for the three adversity effects of interest
+
+For the three effects that survive FDR correction, Model 4 was re-estimated with all other CTQ subscales (and their interactions with age) entered simultaneously. The CTQ × age interaction from the original Model 4 (each subscale alone) is shown next to the same interaction when all five subscales are in the model. p-values are uncorrected.
+
+```{r sens-fits}
+# The three effects of interest (CTQ subscale, outcome)
+effects <- list(
+  list(k = "EA", y = "Apun_qnormed",              label = "Emotional Abuse × Age on Punishment Learning Rate (Apun)"),
+  list(k = "PA", y = "betaB",                     label = "Physical Abuse × Age on Go Bias (βb)"),
+  list(k = "PA", y = "good_proportion_LastBlock", label = "Physical Abuse × Age on Good Deck Proportion (last block)"))
+
+# Extra covariates: the other four subscales and their interactions with age
+other_subscales_terms <- function(k) {
+  others <- setdiff(predictors[subscales, "centered"], predictors[k, "centered"])
+  paste("+", paste(c(others, paste0("age_centered:", others)), collapse = " + "))
+}
+# Minimization/Denial scale and its interaction with age; only participants with
+# a Minimization/Denial score are included (centered versions: *_mdr_c)
+dat_mdr <- dat[!is.na(dat$ctq_mdr_T1_mdr_c), ]
+mdr_terms <- "+ ctq_mdr_T1_mdr_c + age_centered:ctq_mdr_T1_mdr_c"
+
+sens <- lapply(effects, function(e) {
+  cv <- predictors[e$k, "centered"]
+  list(orig = fits[[e$k]][[e$y]],
+       oth  = fit_models(e$y, cv, dat, extra_terms = other_subscales_terms(e$k)),
+       mdr  = fit_models(e$y, sub("_T1_c$", "_T1_mdr_c", cv), dat_mdr, extra_terms = mdr_terms))
+})
+# estimate [CI] and p-value of the age x CTQ interaction in a fit
+age_effect <- function(fit) {
+  fe <- fixed_effects(fit$M4)
+  r <- fe[fe$term == ctq_terms(fit$ctq_var)[["age"]], ]
+  c(cell_est_ci(r$est, r$lo, r$hi, NA), fp(r$p))
+}
+```
+
+```{r supp-table12}
+tab <- do.call(rbind, lapply(seq_along(effects), function(i) c(effects[[i]]$label, age_effect(sens[[i]]$orig), age_effect(sens[[i]]$oth))))
+tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+names(tab) <- c("Adversity × Age effect", "Model 4 (each CTQ predictor alone): b [95% CI]", "p-value",
+                "Model 4 with all five CTQ subscales: b [95% CI]", "p-value ")
+show_table(tab)
+```
+
+## Supplemental Table 13. Robustness analyses for the three adversity effects of interest
+
+Model 4 was re-estimated controlling for the CTQ Minimization/Denial scale and its interaction with age (in participants with Minimization/Denial data). p-values are uncorrected.
+
+```{r supp-table13}
+tab <- do.call(rbind, lapply(seq_along(effects), function(i) c(effects[[i]]$label, age_effect(sens[[i]]$orig), age_effect(sens[[i]]$mdr))))
+tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+names(tab) <- c("Adversity × Age effect", "Model 4 (full sample): b [95% CI]", "p-value",
+                "Model 4 adjusted for Minimization/Denial: b [95% CI]", "p-value ")
+show_table(tab)
+```
+
+## Supplemental Table 14. Assumption checks for the three adversity effects of interest
+
+Normality and constant variance of the Model 4 residuals: skewness and excess kurtosis of the standardized residuals, the percentage of residuals beyond ±2 and ±3 SD (about 4.6% and 0.3% are expected under normality), and Spearman correlations between the absolute residuals and the fitted values and age.
+
+```{r supp-table14}
+# The Model 4 fits for the three effects (already fit above)
+focal <- lapply(effects, function(e) fits[[e$k]][[e$y]])
+skew   <- function(x) mean((x - mean(x))^3) / mean((x - mean(x))^2)^1.5
+exkurt <- function(x) mean((x - mean(x))^4) / mean((x - mean(x))^2)^2 - 3
+age_offset <- mean(dat$age - dat$age_centered)
+resid_df <- do.call(rbind, lapply(seq_along(focal), function(i) {
+  m <- focal[[i]]$M4
+  data.frame(model = effects[[i]]$label, fitted = fitted(m), resid = resid(m),
+             z = resid(m) / sigma(m),                       # standardized residual
+             age = m@frame$age_centered + age_offset)
+}))
+resid_df$model <- factor(resid_df$model, levels = sapply(effects, `[[`, "label"))
+rho <- function(a, b) cor(a, b, method = "spearman")
+tab <- do.call(rbind, lapply(levels(resid_df$model), function(nm) {
+  d <- resid_df[resid_df$model == nm, ]
+  c(nm, f2(skew(d$z)), f2(exkurt(d$z)), sprintf("%.1f", 100 * mean(abs(d$z) > 2)), sprintf("%.1f", 100 * mean(abs(d$z) > 3)),
+    f2(rho(abs(d$resid), d$fitted)), f2(rho(abs(d$resid), d$age)))
+}))
+tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+names(tab) <- c("Adversity × Age effect", "Skewness", "Excess kurtosis", "% beyond ±2 SD", "% beyond ±3 SD",
+                "ρ (|residual|, fitted values)", "ρ (|residual|, age)")
+show_table(tab)
+```
+
+## Supplemental Figure 3. Residual diagnostics for the three adversity effects of interest
+
+Left: normal Q-Q plots of the standardized residuals (points near the red line = approximately normal). Right: standardized residuals against fitted values (an even band around the red zero line with a flat blue smoother = constant variance).
+
+```{r supp-figure3, fig.width = 9, fig.height = 9}
+p_qq <- ggplot(resid_df, aes(sample = z)) +
+  stat_qq(alpha = .35, size = 1) + stat_qq_line(colour = "firebrick") +
+  facet_wrap(~ model, ncol = 1, scales = "free") +
+  labs(x = "Theoretical normal quantiles", y = "Standardized residuals", title = "Normal Q-Q plot") +
+  theme_bw(base_size = 10) + theme(strip.text = element_text(size = 7))
+p_rf <- ggplot(resid_df, aes(fitted, z)) +
+  geom_point(alpha = .35, size = 1) + geom_hline(yintercept = 0, colour = "firebrick") +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE, colour = "steelblue", linewidth = .8) +
+  facet_wrap(~ model, ncol = 1, scales = "free") +
+  labs(x = "Fitted value", y = "Standardized residuals", title = "Residuals vs. fitted values") +
+  theme_bw(base_size = 10) + theme(strip.text = element_text(size = 7))
+print(p_qq | p_rf)
+```
+
+## Supplemental Table 15. Influence analyses for the three adversity effects of interest
+
+The final Model 4 for each effect was re-estimated (a) leaving out each participant in turn (166 refits per effect; Table 15.1) and (b) after removing five participants at a time (Table 15.2). All p-values are uncorrected. The refits below take a few minutes.
+
+```{r influence-fits}
+# -----------------------------------------------------------------------------
+# Leave-one-participant-out refits. For every participant, all of their waves are
+# removed and Model 4 is re-estimated. We save the age x CTQ estimate and p-value,
+# plus two influence measures:
+#   Cook's D  = how far ALL fixed-effect estimates move when the participant is removed
+#   DFBETAS   = how far the key age x CTQ coefficient moves (in standard-error units;
+#               positive = removing the participant lowers the estimate)
+# -----------------------------------------------------------------------------
+ctrl <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+loo_one <- function(m, key, V, beta_full, id_drop) {
+  sub <- dat[as.character(dat$id) != id_drop, ]
+  m2 <- tryCatch(lmer(formula(m), data = sub, REML = FALSE, control = ctrl), error = function(e) NULL)
+  if (is.null(m2)) return(NULL)
+  dB <- beta_full - fixef(m2)[names(beta_full)]
+  cf <- summary(m2)$coefficients[key, ]
+  data.frame(id = id_drop,
+             cook = drop(t(dB) %*% solve(V, dB)) / length(beta_full),
+             dfbetas = unname(dB[key] / sqrt(V[key, key])),
+             est = unname(cf["Estimate"]), p = unname(cf["Pr(>|t|)"]))
+}
+loo <- lapply(seq_along(effects), function(i) {
+  m <- focal[[i]]$M4
+  key <- ctq_terms(focal[[i]]$ctq_var)[["age"]]
+  ids <- unique(as.character(getME(m, "flist")$id))
+  do.call(rbind, mclapply(ids, function(j) loo_one(m, key, as.matrix(vcov(m)), fixef(m), j), mc.cores = n_cores))
+})
+```
+
+### Supplemental Table 15.1. Leave-one-participant-out analysis
+
+```{r supp-table15-1}
+tab <- do.call(rbind, lapply(seq_along(effects), function(i) {
+  L <- loo[[i]]; m <- focal[[i]]$M4
+  key <- ctq_terms(focal[[i]]$ctq_var)[["age"]]
+  full <- summary(m)$coefficients[key, "Estimate"]
+  c(effects[[i]]$label, f3(full), sprintf("%s to %s", f3(min(L$est)), f3(max(L$est))),
+    ifelse(all(sign(L$est) == sign(full)), "Yes", "No"),
+    sprintf("%.0f%%", 100 * mean(L$p < .05)), fp(max(L$p)),
+    sum(L$cook > 4 / nrow(L)), f3(max(L$cook)), f2(max(abs(L$dfbetas))))
+}))
+tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+names(tab) <- c("Adversity × Age effect", "b, full sample", sprintf("Range of b across %d refits", nrow(loo[[1]])),
+                "Same direction in all refits", "Refits with p < .05", "Largest p across refits",
+                "Participants above Cook's D threshold (4/N)", "Largest Cook's D", "Largest |DFBETAS|")
+show_table(tab)
+```
+
+### Supplemental Table 15.2. Re-estimation after removing influential or extreme participants
+
+```{r supp-table15-2}
+n_drop <- 5
+tab <- do.call(rbind, lapply(seq_along(effects), function(i) {
+  L <- loo[[i]]; m <- focal[[i]]$M4; ctq <- focal[[i]]$ctq_var
+  key <- ctq_terms(ctq)[["age"]]
+  # Participants to remove in each scenario
+  top_cook <- L$id[order(-L$cook)][1:n_drop]                    # five largest Cook's D
+  top_dfb  <- L$id[order(-abs(L$dfbetas))][1:n_drop]            # five largest |DFBETAS|
+  person   <- aggregate(dat[[ctq]], list(id = dat$id), function(v) v[!is.na(v)][1])
+  top_ctq  <- as.character(person$id[person$x >= sort(person$x, decreasing = TRUE)[n_drop]])  # highest CTQ scores
+  scen <- list(character(0), top_cook, top_dfb, top_ctq)
+  names(scen) <- c("None (full sample)",
+                   "Drop the 5 most influential participants (Cook's D)",
+                   "Drop the 5 most influential for this interaction (DFBETAS)",
+                   sprintf("Drop the 5 participants with the highest %s scores", tolower(predictors[effects[[i]]$k, "name"])))
+  do.call(rbind, lapply(seq_along(scen), function(s) {
+    keep <- dat[!(as.character(dat$id) %in% scen[[s]]), ]
+    m2 <- lmer(formula(m), data = keep, REML = FALSE, control = ctrl)
+    cf <- summary(m2)$coefficients[key, ]
+    c(if (s == 1) effects[[i]]$label else "", names(scen)[s], length(unique(keep$id[!is.na(keep[[ctq]])])),
+      f3(cf["Estimate"]), f3(cf["Std. Error"]), fp(cf["Pr(>|t|)"]))
+  }))
+}))
+tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+names(tab) <- c("Adversity × Age effect", "Participants removed", "N remaining", "b", "SE", "p-value")
+show_table(tab)
+```
+
+## Supplemental Table 16. Expected change in Net Performance through the learning parameters, by adversity subtype
+
+Model-based estimate of how abuse-related differences in learning could affect Net Performance. For youth 1 SD above and 1 SD below the mean baseline subscale score, the Model 4 growth models predict each learning parameter at each age (9-17 years). The predicted difference in each parameter (in SD units) is multiplied by that parameter's coefficient from the model with all four parameters together (Supplemental Table 7) and the four products are summed (Total). 95% intervals and p-values are Monte Carlo estimates (10,000 draws). The table shows the slope per year of age [95% CI] of the expected difference in Net Performance (percentage points). Values are model-based extrapolations.
+
+```{r supp-table16}
+set.seed(20261019)      # Monte Carlo draws below are random; the seed makes them reproducible
+n_mc    <- 10000
+AGE_REF <- 10.99        # age used to center age (mean age at baseline)
+d16     <- d7           # data from Supplemental Table 7 (Net Performance in percentage points; standardized parameters)
+pred_vars  <- c(EA = "ctq_EA_T1_c", PA = "ctq_PA_T1_c")
+pred_names <- c(EA = "Emotional Abuse", PA = "Physical Abuse")
+RS <- random_fx
+
+# Model 4 for each parameter (same model as in the main analysis; this version
+# writes the formula in the order used when these estimates were first computed)
+fit_param_m4 <- function(y, p, data) {
+  m_lin  <- fit_lmm(sprintf("%s ~ age_centered + %s + %s*age_centered + %s", y, covariates, p, RS), data)$model
+  m_quad <- fit_lmm(sprintf("%s ~ age_centered + age_squared + %s + %s*age_centered + %s*age_squared + %s", y, covariates, p, p, RS), data)$model
+  u1 <- fit_lmm(sprintf("%s ~ age_centered + %s", y, RS), data)$model
+  u2 <- fit_lmm(sprintf("%s ~ age_centered + age_squared + %s", y, RS), data)$model
+  quad <- tryCatch(anova(u1, u2)$`Pr(>Chisq)`[2] < .05, error = function(e) FALSE)
+  if (quad) m_quad else m_lin
+}
+par_fits <- lapply(pred_vars, function(p) { r <- lapply(names(params), function(v) fit_param_m4(v, p, dat)); names(r) <- names(params); r })
+
+design <- function(m, nd) model.matrix(delete.response(terms(lme4::nobars(formula(m)))), nd)
+sd_par <- sapply(names(params), function(v) sd(dat[[v]], na.rm = TRUE))
+T1 <- dat$time == "T1"
+# Mean -/+ 1 SD of the baseline subscale score
+qsd <- lapply(pred_vars, function(p) mean(dat[[p]][T1], na.rm = TRUE) + c(-1, 1) * sd(dat[[p]][T1], na.rm = TRUE))
+age_obs  <- range(dat$age, na.rm = TRUE)
+age_grid <- seq(9, 17.25, by = 0.25); age_grid <- age_grid[age_grid >= age_obs[1] - 0.1 & age_grid <= age_obs[2]]
+
+# Monte Carlo draws: (1) coefficients of the "all four parameters together" model
+# for Net Performance, (2) coefficients of each parameter's Model 4
+bd_joint <- mvrnorm(n_mc, fixef(m_together)[z_names], as.matrix(vcov(m_together))[z_names, z_names])
+bpar_all <- lapply(names(pred_vars), function(k) {
+  r <- lapply(names(params), function(v) { m <- par_fits[[k]][[v]]; mvrnorm(n_mc, fixef(m), as.matrix(vcov(m))) })
+  names(r) <- names(params); r
+}); names(bpar_all) <- names(pred_vars)
+
+# At each age: predicted difference in each parameter between +1 SD and -1 SD
+# youth (in parameter SD units), times the parameter's effect on Net Performance
+ind <- list()
+for (k in names(pred_vars)) {
+  p <- pred_vars[[k]]
+  for (a in age_grid) {
+    contrib <- sapply(names(params), function(v) {
+      m <- par_fits[[k]][[v]]
+      nd <- data.frame(age_centered = a - AGE_REF, age_squared = (a - AGE_REF)^2, NonVerbal_Std_centered = 0,
+                       child_sex = mean(dat$child_sex[T1]), eprime = 1)
+      lo <- nd; hi <- nd; lo[[p]] <- qsd[[k]][1]; hi[[p]] <- qsd[[k]][2]
+      dpar <- as.numeric(bpar_all[[k]][[v]] %*% t(design(m, hi) - design(m, lo)))
+      dpar / sd_par[[v]] * bd_joint[, paste0(v, "_z")]
+    })
+    ind[[paste(k, a)]] <- list(k = k, a = a, contrib = contrib, tot = rowSums(contrib))
+  }
+}
+# Slope over age of the expected difference (percentage points per year)
+slope_rows <- do.call(rbind, lapply(names(pred_vars), function(k) {
+  z  <- ind[paste(k, age_grid)]; ac <- age_grid - mean(age_grid)
+  one <- function(getter, label, first) {
+    M  <- sapply(z, getter)
+    sl <- as.numeric(M %*% ac) / sum(ac^2)
+    ci <- quantile(sl, c(.025, .975))
+    c(if (first) pred_names[[k]] else "", label, sprintf("%.2f [%.2f, %.2f]", mean(sl), ci[1], ci[2]),
+      fp(min(1, 2 * min(mean(sl > 0), mean(sl < 0)))))
+  }
+  rbind(one(function(x) x$tot, "Total (all four learning parameters)", TRUE),
+        do.call(rbind, lapply(names(params), function(v) one(function(x) x$contrib[, v], params[[v]], FALSE))))
+}))
+tab <- as.data.frame(slope_rows, stringsAsFactors = FALSE)
+names(tab) <- c("Adversity Subtype", "Learning Predictor", "Slope per year [95% CI]", "Monte Carlo p-value")
+show_table(tab)
+```
